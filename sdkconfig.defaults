@@ -1,0 +1,20 @@
+# Enable IP forwarding + NAPT (NAT) - this is what actually makes internet
+# sharing possible. This is DISABLED by default in plain Arduino-ESP32,
+# which is why ArduinoDroid-based attempts never got real internet sharing.
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+CONFIG_LWIP_IPV4_NAPT_PORTMAP=y
+
+# Partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# More sockets/headroom for the AP + web server + NAT traffic
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_TCP_MAXRTX=12
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+
+# Flash size (ESP32 DevKit V1 boards are commonly 4MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
