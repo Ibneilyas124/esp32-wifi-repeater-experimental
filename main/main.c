@@ -569,16 +569,20 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 
     cJSON *clients = cJSON_CreateArray();
     wifi_sta_list_t sta_list;
-    wifi_sta_mac_ip_list_t ip_mac_list;
-    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK &&
-        esp_wifi_ap_get_sta_list_with_ip(&sta_list, &ip_mac_list) == ESP_OK) {
+    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+        esp_netif_pair_mac_ip_t pairs[10] = { 0 };
+        for (int i = 0; i < sta_list.num && i < 10; i++) {
+            memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
+        }
+        esp_netif_dhcps_get_clients_by_mac(s_ap_netif, sta_list.num, pairs);
+
         for (int i = 0; i < sta_list.num; i++) {
             char mac[18];
             snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                      ip_mac_list.sta[i].mac[0], ip_mac_list.sta[i].mac[1], ip_mac_list.sta[i].mac[2],
-                      ip_mac_list.sta[i].mac[3], ip_mac_list.sta[i].mac[4], ip_mac_list.sta[i].mac[5]);
+                      sta_list.sta[i].mac[0], sta_list.sta[i].mac[1], sta_list.sta[i].mac[2],
+                      sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
             char ipstr[16];
-            snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip_mac_list.sta[i].ip));
+            snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&pairs[i].ip));
             char name[64] = "";
             whitelist_get_name(mac, name, sizeof(name));
 
