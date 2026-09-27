@@ -1,18 +1,20 @@
 /*
  * ESP32 WiFi Repeater / Internet Sharing Router
  * Board: ESP32 DevKit V1
- * Author: Sarfraz Ibn E Ilyas
+ * Built by Sarfraz Qureshi
  *
  * Connects to an upstream WiFi network (STA) and re-broadcasts internet
  * access over its own access point (AP) using NAPT (NAT), with:
- *   - Password-protected admin web dashboard
+ *   - Public branded landing page (always visible, even to non-admins)
+ *   - Styled login page (session-cookie based, not the plain browser popup)
+ *   - Settings only reachable at /admin after a successful login
  *   - MAC whitelist filtering for AP clients
  *   - JSON config import / export
  *   - Connected clients list
  *   - Reboot button
  *
- * Default AP:      SSID "Sarfraz"   Password "Sarfraz"
- * Default admin:   user  "admin"    Password "Sarfraz"   (change after first boot!)
+ * Default AP:      SSID "Sarfraz"   Password "Sarfraz1"
+ * Default admin:   user  "admin"    Password "Sarfraz1"   (change after first boot!)
  */
 
 #include <string.h>
@@ -23,6 +25,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
 #include "esp_timer.h"
@@ -30,23 +33,23 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
-#include "mbedtls/base64.h"
 #include "lwip/ip4_addr.h"
 
 static const char *TAG = "esp32-repeater";
 
-#define NVS_NS            "repeater"
-#define MAX_WHITELIST     32
-#define DEFAULT_AP_SSID   "Sarfraz"
-#define DEFAULT_AP_PASS   "Sarfraz"
-#define DEFAULT_ADMIN_PASS "Sarfraz"
-#define ADMIN_USER        "admin"
+#define NVS_NS              "repeater"
+#define DEFAULT_AP_SSID     "Sarfraz"
+#define DEFAULT_AP_PASS     "Sarfraz1"     /* WPA2 requires 8+ chars */
+#define DEFAULT_ADMIN_PASS  "Sarfraz1"
+#define ADMIN_USER          "admin"
+#define BUILDER_NAME         "Sarfraz Qureshi"
 
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static bool s_sta_connected = false;
 static char s_sta_ip[16] = "0.0.0.0";
 static int64_t s_boot_time_us = 0;
+static char s_session_token[40] = "";
 
 /* ---------------- NVS helpers ---------------- */
 
@@ -137,6 +140,41 @@ static void whitelist_remove(const char *mac) {
     whitelist_set(out);
 }
 
+/* ---------------- Session auth ---------------- */
+
+static void generate_session_token(char *out, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t bytes[16];
+    for (int i = 0; i < 4; i++) {
+        uint32_t r = esp_random();
+        memcpy(bytes + i * 4, &r, 4);
+    }
+    size_t pos = 0;
+    for (int i = 0; i < 16 && pos + 2 < len; i++) {
+        out[pos++] = hex[(bytes[i] >> 4) & 0xF];
+        out[pos++] = hex[bytes[i] & 0xF];
+    }
+    out[pos] = '\0';
+}
+
+static bool check_session(httpd_req_t *req) {
+    if (strlen(s_session_token) == 0) return false;
+    char cookie[128];
+    if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK) return false;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "session=%s", s_session_token);
+    return strstr(cookie, needle) != NULL;
+}
+
+/* For fetch()-based API calls: reply 401 JSON so the page JS can redirect. */
+static esp_err_t require_session_api(httpd_req_t *req) {
+    if (check_session(req)) return ESP_OK;
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"error\":\"unauthorized\"}", HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+}
+
 /* ---------------- WiFi ---------------- */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -201,7 +239,7 @@ static void wifi_init(void) {
     ap_config.ap.ssid_len = strlen(ap_ssid);
     strncpy((char *)ap_config.ap.password, ap_pass, sizeof(ap_config.ap.password));
     ap_config.ap.max_connection = 8;
-    ap_config.ap.authmode = strlen(ap_pass) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.authmode = strlen(ap_pass) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ap_config.ap.channel = 1;
 
     wifi_config_t sta_config = { 0 };
@@ -209,7 +247,15 @@ static void wifi_init(void) {
     strncpy((char *)sta_config.sta.password, sta_pass, sizeof(sta_config.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+
+    /* If a password shorter than 8 chars ever ends up saved, fall back to
+     * an OPEN network instead of crashing the whole device on boot. */
+    if (esp_wifi_set_config(WIFI_IF_AP, &ap_config) != ESP_OK) {
+        ESP_LOGW(TAG, "AP password invalid (need 8+ chars) - falling back to OPEN network");
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    }
+
     if (strlen(sta_ssid) > 0) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     }
@@ -217,30 +263,92 @@ static void wifi_init(void) {
 
     ESP_LOGI(TAG, "AP up: SSID=%s", ap_ssid);
     if (strlen(sta_ssid) == 0) {
-        ESP_LOGW(TAG, "No upstream WiFi configured yet. Set it from the dashboard (/) -> WiFi tab.");
+        ESP_LOGW(TAG, "No upstream WiFi configured yet. Log in at / then set it under Upstream WiFi.");
     }
 }
 
-/* ---------------- HTTP server / dashboard ---------------- */
+/* ---------------- HTML: public landing + login page ---------------- */
 
-static const char DASHBOARD_HTML[] =
+static const char LANDING_HTML[] =
 "<!DOCTYPE html><html><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Sarfraz Ibn E Ilyas</title>"
+"<title>Sarfraz Qureshi - WiFi Repeater</title>"
+"<style>"
+"*{box-sizing:border-box}"
+"body{margin:0;min-height:100vh;font-family:sans-serif;"
+"background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);"
+"display:flex;align-items:center;justify-content:center;padding:20px;color:#eee}"
+".wrap{width:100%;max-width:420px}"
+".brand{text-align:center;margin-bottom:22px}"
+".brand .badge{display:inline-block;background:linear-gradient(135deg,#00e0a0,#00a3ff);"
+"width:56px;height:56px;border-radius:16px;line-height:56px;font-size:26px;margin-bottom:10px}"
+".brand h1{font-size:1.25em;margin:4px 0 2px;color:#fff}"
+".brand p{margin:0;color:#9fd8c8;font-size:.9em}"
+"section{background:rgba(20,25,30,.75);backdrop-filter:blur(6px);"
+"border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:22px;"
+"box-shadow:0 8px 30px rgba(0,0,0,.35)}"
+"label{display:block;font-size:.8em;color:#9fb3b0;margin:12px 0 4px}"
+"input{width:100%;padding:11px;border-radius:8px;border:1px solid #33474a;"
+"background:#0f1a1d;color:#eee;font-size:15px}"
+"input:focus{outline:none;border-color:#00e0a0}"
+"button{width:100%;margin-top:18px;padding:12px;border:none;border-radius:8px;"
+"background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;font-weight:bold;"
+"font-size:15px;cursor:pointer}"
+"button:active{opacity:.85}"
+"#err{color:#ff8080;font-size:.85em;min-height:18px;margin-top:8px;text-align:center}"
+"footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.78em}"
+"</style></head><body>"
+"<div class='wrap'>"
+"<div class='brand'>"
+"<div class='badge'>&#128225;</div>"
+"<h1>This WiFi Repeater was built by<br>" BUILDER_NAME "</h1>"
+"<p>Secure Admin Access</p>"
+"</div>"
+"<section>"
+"<label>Username</label><input id='u' autocapitalize='off' placeholder='admin'>"
+"<label>Password</label><input id='p' type='password' placeholder='Password'>"
+"<button onclick='doLogin()'>Login</button>"
+"<div id='err'></div>"
+"</section>"
+"<footer>Firmware crafted with care by " BUILDER_NAME "</footer>"
+"</div>"
+"<script>"
+"async function doLogin(){"
+"  const u=document.getElementById('u').value;"
+"  const p=document.getElementById('p').value;"
+"  const e=document.getElementById('err'); e.textContent='';"
+"  try{"
+"    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},"
+"      body:JSON.stringify({username:u,password:p})});"
+"    const j=await r.json();"
+"    if(j.ok){ location.href='/admin'; } else { e.textContent='Invalid username or password'; }"
+"  }catch(ex){ e.textContent='Could not reach device'; }"
+"}"
+"document.getElementById('p').addEventListener('keydown',ev=>{if(ev.key==='Enter')doLogin();});"
+"</script></body></html>";
+
+/* ---------------- HTML: admin dashboard (only after login) ---------------- */
+
+static const char ADMIN_HTML[] =
+"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>" BUILDER_NAME " - Admin</title>"
 "<style>"
 "body{background:#0d0d0d;color:#eee;font-family:sans-serif;margin:0;padding:16px}"
 "h1{color:#00e0a0;font-size:1.3em;border-bottom:1px solid #333;padding-bottom:8px}"
+"h1 small{display:block;color:#7fa79c;font-size:.55em;font-weight:normal;margin-top:4px}"
 "h2{color:#00e0a0;font-size:1em;margin-top:24px}"
 "section{background:#161616;border:1px solid #2a2a2a;border-radius:8px;padding:12px;margin-bottom:14px}"
 "input,button,textarea{background:#1f1f1f;color:#eee;border:1px solid #333;border-radius:6px;padding:8px;margin:4px 0;width:100%;box-sizing:border-box;font-size:14px}"
 "button{background:#00e0a0;color:#0d0d0d;font-weight:bold;cursor:pointer;border:none}"
 "button.danger{background:#e04040;color:#fff}"
+"button.ghost{background:#222;color:#aaa;border:1px solid #333}"
 ".row{display:flex;gap:8px}"
 "table{width:100%;border-collapse:collapse;font-size:13px}"
 "td,th{border-bottom:1px solid #2a2a2a;padding:6px;text-align:left}"
 "small{color:#888}"
 "</style></head><body>"
-"<h1>Sarfraz Ibn E Ilyas &mdash; WiFi Repeater Admin</h1>"
+"<h1>" BUILDER_NAME " &mdash; WiFi Repeater Admin<small>Logged in as admin</small></h1>"
 
 "<section><h2>Status</h2><div id='status'>Loading...</div></section>"
 
@@ -259,11 +367,15 @@ static const char DASHBOARD_HTML[] =
 "<textarea id='importbox' rows='4' placeholder='Paste config JSON here to import'></textarea>"
 "<button onclick='importCfg()'>Import &amp; Reboot</button></section>"
 
-"<section><button class='danger' onclick=\"fetch('/api/reboot',{method:'POST'})\">Reboot Device</button></section>"
+"<section><div class='row'>"
+"<button class='ghost' onclick='logout()'>Logout</button>"
+"<button class='danger' onclick=\"fetch('/api/reboot',{method:'POST'})\">Reboot Device</button>"
+"</div></section>"
 
 "<script>"
+"function authFail(r){ if(r.status===401){ location.href='/'; return true;} return false;}"
 "async function refresh(){"
-"  const r=await fetch('/api/status'); const j=await r.json();"
+"  const r=await fetch('/api/status'); if(authFail(r))return; const j=await r.json();"
 "  document.getElementById('status').innerHTML="
 "    'Upstream: '+(j.sta_connected?('Connected ('+j.sta_ip+')'):'Not connected')+"
 "    '<br>Uptime: '+j.uptime_s+'s'+"
@@ -274,68 +386,107 @@ static const char DASHBOARD_HTML[] =
 "    '<div class=row><input readonly value=\"'+m+'\"><button class=danger onclick=\"rmMac(\\''+m+'\\')\">X</button></div>').join('')||'<small>No restrictions</small>';"
 "}"
 "async function saveWifi(){"
-"  await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},"
+"  const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},"
 "    body:JSON.stringify({ssid:document.getElementById('sta_ssid').value,password:document.getElementById('sta_pass').value})});"
+"  if(authFail(r))return;"
 "  alert('Saved. Device is rebooting...');"
 "}"
 "async function addMac(){"
 "  const m=document.getElementById('newmac').value.trim(); if(!m)return;"
-"  await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',mac:m})});"
-"  refresh();"
+"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',mac:m})});"
+"  if(authFail(r))return; refresh();"
 "}"
 "async function rmMac(m){"
-"  await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',mac:m})});"
-"  refresh();"
+"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',mac:m})});"
+"  if(authFail(r))return; refresh();"
 "}"
 "async function exportCfg(){"
-"  const r=await fetch('/api/config/export'); const t=await r.text();"
+"  const r=await fetch('/api/config/export'); if(authFail(r))return; const t=await r.text();"
 "  document.getElementById('importbox').value=t;"
 "}"
 "async function importCfg(){"
 "  const t=document.getElementById('importbox').value;"
-"  await fetch('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:t});"
+"  const r=await fetch('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:t});"
+"  if(authFail(r))return;"
 "  alert('Imported. Device is rebooting...');"
 "}"
+"async function logout(){ await fetch('/api/logout',{method:'POST'}); location.href='/'; }"
 "refresh(); setInterval(refresh,5000);"
 "</script></body></html>";
 
-static bool check_auth(httpd_req_t *req) {
-    char admin_pass[65];
-    nvs_get_string("admin_pass", admin_pass, sizeof(admin_pass), DEFAULT_ADMIN_PASS);
-
-    char expected_plain[128];
-    snprintf(expected_plain, sizeof(expected_plain), "%s:%s", ADMIN_USER, admin_pass);
-    unsigned char expected_b64[192];
-    size_t expected_len = 0;
-    mbedtls_base64_encode(expected_b64, sizeof(expected_b64), &expected_len,
-                           (unsigned char *)expected_plain, strlen(expected_plain));
-
-    char header[256];
-    if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) != ESP_OK) {
-        return false;
-    }
-    char expected_hdr[220];
-    snprintf(expected_hdr, sizeof(expected_hdr), "Basic %.*s", (int)expected_len, expected_b64);
-    return strcmp(header, expected_hdr) == 0;
-}
-
-static esp_err_t require_auth_or_401(httpd_req_t *req) {
-    if (check_auth(req)) return ESP_OK;
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Sarfraz Ibn E Ilyas\"");
-    httpd_resp_send(req, "Login required", HTTPD_RESP_USE_STRLEN);
-    return ESP_FAIL;
-}
+/* ---------------- HTTP handlers ---------------- */
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    /* Public page: always visible, no login required. Shows branding + login form. */
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, LANDING_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t admin_get_handler(httpd_req_t *req) {
+    if (!check_session(req)) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, ADMIN_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buf_len) {
+    int total = 0;
+    int r;
+    while (total < (int)buf_len - 1) {
+        r = httpd_req_recv(req, buf + total, buf_len - 1 - total);
+        if (r <= 0) break;
+        total += r;
+    }
+    buf[total] = '\0';
+    return ESP_OK;
+}
+
+static esp_err_t login_post_handler(httpd_req_t *req) {
+    char buf[256];
+    read_body(req, buf, sizeof(buf));
+    cJSON *j = cJSON_Parse(buf);
+    bool ok = false;
+    if (j) {
+        cJSON *user = cJSON_GetObjectItem(j, "username");
+        cJSON *pass = cJSON_GetObjectItem(j, "password");
+        char admin_pass[65];
+        nvs_get_string("admin_pass", admin_pass, sizeof(admin_pass), DEFAULT_ADMIN_PASS);
+        if (cJSON_IsString(user) && cJSON_IsString(pass) &&
+            strcmp(user->valuestring, ADMIN_USER) == 0 &&
+            strcmp(pass->valuestring, admin_pass) == 0) {
+            ok = true;
+        }
+        cJSON_Delete(j);
+    }
+    httpd_resp_set_type(req, "application/json");
+    if (ok) {
+        generate_session_token(s_session_token, sizeof(s_session_token));
+        char cookie_hdr[80];
+        snprintf(cookie_hdr, sizeof(cookie_hdr), "session=%s; Path=/; HttpOnly", s_session_token);
+        httpd_resp_set_hdr(req, "Set-Cookie", cookie_hdr);
+        httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t logout_post_handler(httpd_req_t *req) {
+    s_session_token[0] = '\0';
+    httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; Max-Age=0");
+    httpd_resp_send(req, "ok", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "sta_connected", s_sta_connected);
@@ -383,20 +534,8 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buf_len) {
-    int total = 0;
-    int r;
-    while (total < (int)buf_len - 1) {
-        r = httpd_req_recv(req, buf + total, buf_len - 1 - total);
-        if (r <= 0) break;
-        total += r;
-    }
-    buf[total] = '\0';
-    return ESP_OK;
-}
-
 static esp_err_t whitelist_post_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
     char buf[256];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
@@ -414,7 +553,7 @@ static esp_err_t whitelist_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t wifi_post_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
     char buf[256];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
@@ -432,7 +571,7 @@ static esp_err_t wifi_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t config_export_get_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
     cJSON *root = cJSON_CreateObject();
     char v[128];
 
@@ -454,7 +593,7 @@ static esp_err_t config_export_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t config_import_post_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
     char buf[1024];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
@@ -475,7 +614,7 @@ static esp_err_t config_import_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t reboot_post_handler(httpd_req_t *req) {
-    if (require_auth_or_401(req) != ESP_OK) return ESP_OK;
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
     httpd_resp_send(req, "rebooting", HTTPD_RESP_USE_STRLEN);
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_restart();
@@ -484,11 +623,14 @@ static esp_err_t reboot_post_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t uris[] = {
             {.uri = "/", .method = HTTP_GET, .handler = root_get_handler},
+            {.uri = "/admin", .method = HTTP_GET, .handler = admin_get_handler},
+            {.uri = "/api/login", .method = HTTP_POST, .handler = login_post_handler},
+            {.uri = "/api/logout", .method = HTTP_POST, .handler = logout_post_handler},
             {.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler},
             {.uri = "/api/whitelist", .method = HTTP_POST, .handler = whitelist_post_handler},
             {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post_handler},
