@@ -33,6 +33,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "dhcpserver/dhcpserver_options.h"
 #include "lwip/ip4_addr.h"
 
 static const char *TAG = "esp32-repeater";
@@ -76,8 +77,8 @@ static void nvs_set_string(const char *key, const char *val) {
     }
 }
 
-/* Whitelist stored as a single comma-separated string of MACs, e.g.
- * "AA:BB:CC:DD:EE:FF,11:22:33:44:55:66"  An empty string means "allow all". */
+/* Whitelist stored as "MAC|Name,MAC2|Name2,...". Empty string means "allow all".
+ * Name is optional (can be empty) and lets you label whose device it is. */
 
 static void whitelist_get(char *out, size_t out_len) {
     nvs_get_string("whitelist", out, out_len, "");
@@ -91,6 +92,22 @@ static bool mac_str_eq(const char *a, const char *b) {
     return strcasecmp(a, b) == 0;
 }
 
+static void split_entry(const char *entry, char *mac_out, size_t mac_len, char *name_out, size_t name_len) {
+    const char *bar = strchr(entry, '|');
+    if (bar) {
+        size_t mlen = (size_t)(bar - entry);
+        if (mlen >= mac_len) mlen = mac_len - 1;
+        memcpy(mac_out, entry, mlen);
+        mac_out[mlen] = '\0';
+        strncpy(name_out, bar + 1, name_len - 1);
+        name_out[name_len - 1] = '\0';
+    } else {
+        strncpy(mac_out, entry, mac_len - 1);
+        mac_out[mac_len - 1] = '\0';
+        name_out[0] = '\0';
+    }
+}
+
 static bool whitelist_contains(const char *mac) {
     char list[512];
     whitelist_get(list, sizeof(list));
@@ -100,24 +117,37 @@ static bool whitelist_contains(const char *mac) {
     bool found = false;
     while (tok) {
         while (*tok == ' ') tok++;
-        if (mac_str_eq(tok, mac)) { found = true; break; }
+        char m[18], n[64];
+        split_entry(tok, m, sizeof(m), n, sizeof(n));
+        if (mac_str_eq(m, mac)) { found = true; break; }
         tok = strtok(NULL, ",");
     }
     free(copy);
     return found;
 }
 
-static void whitelist_add(const char *mac) {
+/* Looks up the friendly name saved for a MAC (used in the connected-clients list). */
+static bool whitelist_get_name(const char *mac, char *name_out, size_t name_len) {
     char list[512];
     whitelist_get(list, sizeof(list));
-    if (strstr(list, mac)) return;
-    if (strlen(list) == 0) {
-        whitelist_set(mac);
-    } else {
-        char buf[600];
-        snprintf(buf, sizeof(buf), "%s,%s", list, mac);
-        whitelist_set(buf);
+    if (strlen(list) == 0) return false;
+    char *copy = strdup(list);
+    char *tok = strtok(copy, ",");
+    bool found = false;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        char m[18], n[64];
+        split_entry(tok, m, sizeof(m), n, sizeof(n));
+        if (mac_str_eq(m, mac)) {
+            strncpy(name_out, n, name_len - 1);
+            name_out[name_len - 1] = '\0';
+            found = true;
+            break;
+        }
+        tok = strtok(NULL, ",");
     }
+    free(copy);
+    return found;
 }
 
 static void whitelist_remove(const char *mac) {
@@ -129,7 +159,9 @@ static void whitelist_remove(const char *mac) {
     bool first = true;
     while (tok) {
         while (*tok == ' ') tok++;
-        if (!mac_str_eq(tok, mac)) {
+        char m[18], n[64];
+        split_entry(tok, m, sizeof(m), n, sizeof(n));
+        if (!mac_str_eq(m, mac)) {
             if (!first) strncat(out, ",", sizeof(out) - strlen(out) - 1);
             strncat(out, tok, sizeof(out) - strlen(out) - 1);
             first = false;
@@ -138,6 +170,21 @@ static void whitelist_remove(const char *mac) {
     }
     free(copy);
     whitelist_set(out);
+}
+
+static void whitelist_add(const char *mac, const char *name) {
+    whitelist_remove(mac); /* drop any previous entry for this MAC so re-adding renames it */
+    char list[512];
+    whitelist_get(list, sizeof(list));
+    char entry[100];
+    snprintf(entry, sizeof(entry), "%s|%s", mac, (name && strlen(name)) ? name : "");
+    if (strlen(list) == 0) {
+        whitelist_set(entry);
+    } else {
+        char buf[650];
+        snprintf(buf, sizeof(buf), "%s,%s", list, entry);
+        whitelist_set(buf);
+    }
 }
 
 /* ---------------- Session auth ---------------- */
@@ -212,6 +259,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_sta_connected = true;
         ESP_LOGI(TAG, "Got upstream IP: %s -- enabling NAT/NAPT", s_sta_ip);
         esp_netif_napt_enable(s_ap_netif);
+
+        /* Without this, the AP advertises itself (192.168.4.1) as the DNS
+         * server to connected clients. ESP32 doesn't run a DNS resolver, so
+         * clients show "connected, no internet" even though NAT works fine.
+         * Fix: forward the upstream router's real DNS server to AP clients. */
+        esp_netif_dns_info_t dns;
+        if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+            esp_netif_dhcps_stop(s_ap_netif);
+            esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+            dhcps_offer_t dhcps_dns_value = OFFER_DNS;
+            esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                                    &dhcps_dns_value, sizeof(dhcps_dns_value));
+            esp_netif_dhcps_start(s_ap_netif);
+            ESP_LOGI(TAG, "AP clients will now use upstream DNS for browsing");
+        }
     }
 }
 
@@ -359,8 +421,9 @@ static const char ADMIN_HTML[] =
 
 "<section><h2>MAC Whitelist</h2><small>Leave empty to allow all devices.</small>"
 "<div id='wl'></div>"
-"<div class='row'><input id='newmac' placeholder='AA:BB:CC:DD:EE:FF'>"
-"<button onclick='addMac()'>Add</button></div></section>"
+"<input id='newmac' placeholder='AA:BB:CC:DD:EE:FF'>"
+"<input id='newname' placeholder=\"Device name (e.g. Sarfraz's Phone)\">"
+"<button onclick='addMac()'>Add to Whitelist</button></section>"
 
 "<section><h2>Config Backup</h2>"
 "<div class='row'><button onclick='exportCfg()'>Export JSON</button></div>"
@@ -374,16 +437,19 @@ static const char ADMIN_HTML[] =
 
 "<script>"
 "function authFail(r){ if(r.status===401){ location.href='/'; return true;} return false;}"
+"let loaded=false;"
 "async function refresh(){"
 "  const r=await fetch('/api/status'); if(authFail(r))return; const j=await r.json();"
 "  document.getElementById('status').innerHTML="
 "    'Upstream: '+(j.sta_connected?('Connected ('+j.sta_ip+')'):'Not connected')+"
+"    (j.sta_connected?('<br><b>Remote admin access:</b> http://'+j.sta_ip+'<br><small>Open this from any device on your main router\\'s network to reach this same dashboard.</small>'):'')+"
 "    '<br>Uptime: '+j.uptime_s+'s'+"
 "    '<br>Free heap: '+j.free_heap+' bytes'+"
-"    '<br><table><tr><th>Client MAC</th></tr>'+j.clients.map(c=>'<tr><td>'+c+'</td></tr>').join('')+'</table>';"
-"  document.getElementById('sta_ssid').value=j.sta_ssid||'';"
-"  document.getElementById('wl').innerHTML=j.whitelist.map(m=>"
-"    '<div class=row><input readonly value=\"'+m+'\"><button class=danger onclick=\"rmMac(\\''+m+'\\')\">X</button></div>').join('')||'<small>No restrictions</small>';"
+"    '<br><table><tr><th>Name</th><th>MAC</th><th>IP</th></tr>'+"
+"      j.clients.map(c=>'<tr><td>'+(c.name||'-')+'</td><td>'+c.mac+'</td><td>'+c.ip+'</td></tr>').join('')+'</table>';"
+"  if(!loaded){ document.getElementById('sta_ssid').value=j.sta_ssid||''; loaded=true; }"
+"  document.getElementById('wl').innerHTML=j.whitelist.map(w=>"
+"    '<div class=row><input readonly value=\"'+(w.name?w.name+' - ':'')+w.mac+'\"><button class=danger onclick=\"rmMac(\\''+w.mac+'\\')\">X</button></div>').join('')||'<small>No restrictions</small>';"
 "}"
 "async function saveWifi(){"
 "  const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},"
@@ -393,8 +459,11 @@ static const char ADMIN_HTML[] =
 "}"
 "async function addMac(){"
 "  const m=document.getElementById('newmac').value.trim(); if(!m)return;"
-"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',mac:m})});"
-"  if(authFail(r))return; refresh();"
+"  const n=document.getElementById('newname').value.trim();"
+"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',mac:m,name:n})});"
+"  if(authFail(r))return;"
+"  document.getElementById('newmac').value=''; document.getElementById('newname').value='';"
+"  refresh();"
 "}"
 "async function rmMac(m){"
 "  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',mac:m})});"
@@ -500,13 +569,24 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 
     cJSON *clients = cJSON_CreateArray();
     wifi_sta_list_t sta_list;
-    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+    wifi_sta_mac_ip_list_t ip_mac_list;
+    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK &&
+        esp_wifi_ap_get_sta_list_with_ip(&sta_list, &ip_mac_list) == ESP_OK) {
         for (int i = 0; i < sta_list.num; i++) {
             char mac[18];
             snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                      sta_list.sta[i].mac[0], sta_list.sta[i].mac[1], sta_list.sta[i].mac[2],
-                      sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
-            cJSON_AddItemToArray(clients, cJSON_CreateString(mac));
+                      ip_mac_list.sta[i].mac[0], ip_mac_list.sta[i].mac[1], ip_mac_list.sta[i].mac[2],
+                      ip_mac_list.sta[i].mac[3], ip_mac_list.sta[i].mac[4], ip_mac_list.sta[i].mac[5]);
+            char ipstr[16];
+            snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&ip_mac_list.sta[i].ip));
+            char name[64] = "";
+            whitelist_get_name(mac, name, sizeof(name));
+
+            cJSON *c = cJSON_CreateObject();
+            cJSON_AddStringToObject(c, "mac", mac);
+            cJSON_AddStringToObject(c, "ip", ipstr);
+            cJSON_AddStringToObject(c, "name", name);
+            cJSON_AddItemToArray(clients, c);
         }
     }
     cJSON_AddItemToObject(root, "clients", clients);
@@ -519,7 +599,12 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
         char *tok = strtok(copy, ",");
         while (tok) {
             while (*tok == ' ') tok++;
-            cJSON_AddItemToArray(wl, cJSON_CreateString(tok));
+            char m[18], n[64];
+            split_entry(tok, m, sizeof(m), n, sizeof(n));
+            cJSON *e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "mac", m);
+            cJSON_AddStringToObject(e, "name", n);
+            cJSON_AddItemToArray(wl, e);
             tok = strtok(NULL, ",");
         }
         free(copy);
@@ -536,15 +621,18 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 
 static esp_err_t whitelist_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
-    char buf[256];
+    char buf[300];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
     if (j) {
         cJSON *action = cJSON_GetObjectItem(j, "action");
         cJSON *mac = cJSON_GetObjectItem(j, "mac");
+        cJSON *name = cJSON_GetObjectItem(j, "name");
         if (cJSON_IsString(action) && cJSON_IsString(mac)) {
-            if (strcmp(action->valuestring, "add") == 0) whitelist_add(mac->valuestring);
-            else if (strcmp(action->valuestring, "remove") == 0) whitelist_remove(mac->valuestring);
+            if (strcmp(action->valuestring, "add") == 0)
+                whitelist_add(mac->valuestring, cJSON_IsString(name) ? name->valuestring : "");
+            else if (strcmp(action->valuestring, "remove") == 0)
+                whitelist_remove(mac->valuestring);
         }
         cJSON_Delete(j);
     }
