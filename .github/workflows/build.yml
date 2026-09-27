@@ -1,5 +1,6 @@
 name: Build ESP32 Firmware
-
+permissions:
+  contents: write
 on:
   push:
     branches: [ main ]
