@@ -38,8 +38,8 @@ static const char *TAG = "esp32-repeater";
 #define NVS_NS            "repeater"
 #define MAX_WHITELIST     32
 #define DEFAULT_AP_SSID   "Sarfraz"
-#define DEFAULT_AP_PASS   "Sarfraz"
-#define DEFAULT_ADMIN_PASS "Sarfraz"
+#define DEFAULT_AP_PASS   "Sarfraz1"
+#define DEFAULT_ADMIN_PASS "Sarfraz1"
 #define ADMIN_USER        "admin"
 
 static esp_netif_t *s_ap_netif = NULL;
@@ -209,7 +209,11 @@ static void wifi_init(void) {
     strncpy((char *)sta_config.sta.password, sta_pass, sizeof(sta_config.sta.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    if (esp_wifi_set_config(WIFI_IF_AP, &ap_config) != ESP_OK) {
+        ESP_LOGW(TAG, "AP password invalid (need 8+ chars) - falling back to OPEN network");
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    }
     if (strlen(sta_ssid) > 0) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     }
