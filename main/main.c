@@ -1,26 +1,22 @@
 /*
- * ESP32 WiFi Repeater / Internet Sharing Router
- * Board: ESP32 DevKit V1
- * Built by Sarfraz Qureshi
+ * ESP32 WiFi Repeater / Internet Sharing Router (NAPT)
+ * Board: ESP32 DevKit V1        Built by Sarfraz Qureshi - Ibn e Ilyas Technologies
  *
- * Connects to an upstream WiFi network (STA) and re-broadcasts internet
- * access over its own access point (AP) using NAPT (NAT), with:
- *   - Public branded landing page (always visible, even to non-admins)
- *   - Styled login page (session-cookie based, not the plain browser popup)
- *   - Settings only reachable at /admin after a successful login
- *   - MAC whitelist filtering for AP clients
- *   - JSON config import / export
- *   - Connected clients list
- *   - Reboot button
- *
- * Default AP:      SSID "Sarfraz"   Password "Sarfraz1"
- * Default admin:   user  "admin"    Password "Sarfraz1"   (change after first boot!)
+ * - STA connects to the main router, AP re-shares the internet through NAT
+ * - DNS handed to clients is configurable (default 8.8.8.8) - fixes "connected, no internet"
+ * - Name shown in the main router's client list is configurable (DHCP hostname)
+ * - Styled login page (fixed user "Sarfraz", default password "admin", password changeable)
+ * - Advanced settings table (all editable, all with defaults), MAC whitelist with device names
+ * - Hardware factory reset: hold the BOOT button ~8 s, release when the LED blinks fast
  */
 
 #include <string.h>
+#include <strings.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -35,14 +31,18 @@
 #include "cJSON.h"
 #include "lwip/ip4_addr.h"
 
-static const char *TAG = "esp32-repeater";
+static const char *TAG = "repeater";
 
-#define NVS_NS              "repeater"
-#define DEFAULT_AP_SSID     "Sarfraz"
-#define DEFAULT_AP_PASS     "Sarfraz1"     /* WPA2 requires 8+ chars */
-#define DEFAULT_ADMIN_PASS  "Sarfraz1"
-#define ADMIN_USER          "admin"
-#define BUILDER_NAME         "Sarfraz Qureshi"
+#define NVS_NS            "repeater"
+#define ADMIN_USER        "Sarfraz"        /* fixed, not changeable */
+#define WL_BUF            1024             /* whitelist storage buffer */
+#define RESET_BTN_GPIO    GPIO_NUM_0       /* BOOT button on DevKit V1 */
+#define LED_GPIO          GPIO_NUM_2       /* onboard blue LED on DevKit V1 */
+#define RESET_HOLD_MS     8000
+
+/* HTML pages embedded from login.html / admin.html (see main/CMakeLists.txt) */
+extern const char login_html_start[] asm("_binary_login_html_start");
+extern const char admin_html_start[] asm("_binary_admin_html_start");
 
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
@@ -51,7 +51,32 @@ static char s_sta_ip[16] = "0.0.0.0";
 static int64_t s_boot_time_us = 0;
 static char s_session_token[40] = "";
 
-/* ---------------- NVS helpers ---------------- */
+/* ================= Settings table (single source of truth) ================= */
+
+typedef struct {
+    const char *key;
+    const char *label;
+    const char *def;     /* default value */
+    const char *type;    /* text | password | password_keep | number | bool */
+    const char *hint;
+} setting_t;
+
+static const setting_t SETTINGS[] = {
+    {"ap_ssid",    "Repeater WiFi name (SSID)",        "Sarfraz",                  "text",          "1-32 characters"},
+    {"ap_pass",    "Repeater WiFi password",           "Sarfraz1",                 "password",      "8-63 characters. Blank = open network (no password)"},
+    {"ap_hidden",  "Hide repeater WiFi name",          "0",                        "bool",          "Hidden networks must be added manually on phones"},
+    {"ap_channel", "Repeater channel",                 "1",                        "number",        "1-13. Automatically follows the main router while connected"},
+    {"ap_max_conn","Max connected devices",            "8",                        "number",        "1-10"},
+    {"ap_ip",      "Repeater IP address",              "192.168.4.1",              "text",          "Change only if it clashes with the main router's network"},
+    {"dns1",       "DNS server given to clients",      "8.8.8.8",                  "text",          "If sites do not open try 8.8.8.8, 8.8.4.4, 1.1.1.1 or your ISP DNS"},
+    {"hostname",   "Name shown in main router",        "Ibn-e-Ilyas-Technologies", "text",          "1-32 characters. Letters, digits and hyphen work best on routers"},
+    {"sta_mac",    "Custom MAC toward main router",    "",                         "text",          "Blank = factory MAC. Format AA:BB:CC:DD:EE:FF, first byte must be even"},
+    {"tx_power",   "Transmit power (dBm)",             "20",                       "number",        "2-20. Lower it if the device overheats"},
+    {"admin_pass", "Admin password",                   "admin",                    "password_keep", "4-32 characters. Leave blank to keep the current one"},
+};
+#define N_SETTINGS (sizeof(SETTINGS) / sizeof(SETTINGS[0]))
+
+/* ================= NVS helpers ================= */
 
 static void nvs_get_string(const char *key, char *out, size_t out_len, const char *def) {
     nvs_handle_t h;
@@ -76,8 +101,97 @@ static void nvs_set_string(const char *key, const char *val) {
     }
 }
 
-/* Whitelist stored as "MAC|Name,MAC2|Name2,...". Empty string means "allow all".
- * Name is optional (can be empty) and lets you label whose device it is. */
+static void wipe_settings(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static const setting_t *find_setting(const char *key) {
+    for (size_t i = 0; i < N_SETTINGS; i++) {
+        if (strcmp(SETTINGS[i].key, key) == 0) return &SETTINGS[i];
+    }
+    return NULL;
+}
+
+static void get_setting(const char *key, char *out, size_t out_len) {
+    const setting_t *s = find_setting(key);
+    nvs_get_string(key, out, out_len, s ? s->def : "");
+}
+
+static int get_setting_int(const char *key, int lo, int hi, int fallback) {
+    char b[16];
+    get_setting(key, b, sizeof(b));
+    if (b[0] == '\0') return fallback;
+    int v = atoi(b);
+    if (v < lo || v > hi) return fallback;
+    return v;
+}
+
+/* ================= Validation ================= */
+
+static bool valid_host_ipv4(const char *s) {
+    unsigned a, b, c, d;
+    char extra;
+    if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) return false;
+    if (a < 1 || a > 223 || b > 255 || c > 255 || d < 1 || d > 254) return false;
+    return true;
+}
+
+static bool parse_mac(const char *s, uint8_t out[6]) {
+    unsigned v[6];
+    char extra;
+    if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x%c", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &extra) != 6) return false;
+    for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+    return true;
+}
+
+static bool int_in_range(const char *v, int lo, int hi) {
+    if (*v == '\0' || strlen(v) > 4) return false;
+    for (const char *p = v; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    int x = atoi(v);
+    return x >= lo && x <= hi;
+}
+
+static bool validate_setting(const char *key, const char *v, char *err, size_t n) {
+    size_t len = strlen(v);
+    if (strcmp(key, "ap_ssid") == 0) {
+        if (len < 1 || len > 32) { snprintf(err, n, "must be 1-32 characters"); return false; }
+    } else if (strcmp(key, "ap_pass") == 0) {
+        if (len != 0 && (len < 8 || len > 63)) { snprintf(err, n, "must be 8-63 characters (or blank for open network)"); return false; }
+    } else if (strcmp(key, "ap_hidden") == 0) {
+        if (strcmp(v, "0") != 0 && strcmp(v, "1") != 0) { snprintf(err, n, "must be 0 or 1"); return false; }
+    } else if (strcmp(key, "ap_channel") == 0) {
+        if (!int_in_range(v, 1, 13)) { snprintf(err, n, "must be 1-13"); return false; }
+    } else if (strcmp(key, "ap_max_conn") == 0) {
+        if (!int_in_range(v, 1, 10)) { snprintf(err, n, "must be 1-10"); return false; }
+    } else if (strcmp(key, "ap_ip") == 0 || strcmp(key, "dns1") == 0) {
+        if (!valid_host_ipv4(v)) { snprintf(err, n, "must be a valid IPv4 address like 192.168.4.1"); return false; }
+    } else if (strcmp(key, "hostname") == 0) {
+        if (len < 1 || len > 32) { snprintf(err, n, "must be 1-32 characters"); return false; }
+        for (size_t i = 0; i < len; i++) {
+            if ((unsigned char)v[i] < 0x20) { snprintf(err, n, "contains invalid characters"); return false; }
+        }
+    } else if (strcmp(key, "sta_mac") == 0) {
+        uint8_t m[6];
+        if (len != 0 && (!parse_mac(v, m) || (m[0] & 1))) {
+            snprintf(err, n, "must look like AA:BB:CC:DD:EE:FF with an even first byte");
+            return false;
+        }
+    } else if (strcmp(key, "tx_power") == 0) {
+        if (!int_in_range(v, 2, 20)) { snprintf(err, n, "must be 2-20"); return false; }
+    } else if (strcmp(key, "admin_pass") == 0) {
+        if (len < 4 || len > 32) { snprintf(err, n, "must be 4-32 characters"); return false; }
+    }
+    return true;
+}
+
+/* ================= MAC whitelist: "MAC|Name,MAC|Name,..." (empty = allow all) ================= */
 
 static void whitelist_get(char *out, size_t out_len) {
     nvs_get_string("whitelist", out, out_len, "");
@@ -108,15 +222,16 @@ static void split_entry(const char *entry, char *mac_out, size_t mac_len, char *
 }
 
 static bool whitelist_contains(const char *mac) {
-    char list[512];
+    char list[WL_BUF];
     whitelist_get(list, sizeof(list));
-    if (strlen(list) == 0) return true; /* empty whitelist = allow everyone */
+    if (strlen(list) == 0) return true;
     char *copy = strdup(list);
+    if (!copy) return true;
     char *tok = strtok(copy, ",");
     bool found = false;
     while (tok) {
         while (*tok == ' ') tok++;
-        char m[18], n[64];
+        char m[20], n[64];
         split_entry(tok, m, sizeof(m), n, sizeof(n));
         if (mac_str_eq(m, mac)) { found = true; break; }
         tok = strtok(NULL, ",");
@@ -125,17 +240,17 @@ static bool whitelist_contains(const char *mac) {
     return found;
 }
 
-/* Looks up the friendly name saved for a MAC (used in the connected-clients list). */
 static bool whitelist_get_name(const char *mac, char *name_out, size_t name_len) {
-    char list[512];
+    char list[WL_BUF];
     whitelist_get(list, sizeof(list));
     if (strlen(list) == 0) return false;
     char *copy = strdup(list);
+    if (!copy) return false;
     char *tok = strtok(copy, ",");
     bool found = false;
     while (tok) {
         while (*tok == ' ') tok++;
-        char m[18], n[64];
+        char m[20], n[64];
         split_entry(tok, m, sizeof(m), n, sizeof(n));
         if (mac_str_eq(m, mac)) {
             strncpy(name_out, n, name_len - 1);
@@ -150,15 +265,16 @@ static bool whitelist_get_name(const char *mac, char *name_out, size_t name_len)
 }
 
 static void whitelist_remove(const char *mac) {
-    char list[512];
+    char list[WL_BUF];
     whitelist_get(list, sizeof(list));
-    char out[512] = "";
+    char out[WL_BUF] = "";
     char *copy = strdup(list);
+    if (!copy) return;
     char *tok = strtok(copy, ",");
     bool first = true;
     while (tok) {
         while (*tok == ' ') tok++;
-        char m[18], n[64];
+        char m[20], n[64];
         split_entry(tok, m, sizeof(m), n, sizeof(n));
         if (!mac_str_eq(m, mac)) {
             if (!first) strncat(out, ",", sizeof(out) - strlen(out) - 1);
@@ -171,22 +287,32 @@ static void whitelist_remove(const char *mac) {
     whitelist_set(out);
 }
 
-static void whitelist_add(const char *mac, const char *name) {
-    whitelist_remove(mac); /* drop any previous entry for this MAC so re-adding renames it */
-    char list[512];
+/* Adds or renames an entry. Returns false when the list is full. */
+static bool whitelist_add(const char *mac, const char *name) {
+    whitelist_remove(mac);
+    char clean[48];
+    size_t j = 0;
+    for (size_t i = 0; name && name[i] && j < sizeof(clean) - 1; i++) {
+        clean[j++] = (name[i] == ',' || name[i] == '|') ? ' ' : name[i];
+    }
+    clean[j] = '\0';
+
+    char list[WL_BUF];
     whitelist_get(list, sizeof(list));
-    char entry[100];
-    snprintf(entry, sizeof(entry), "%s|%s", mac, (name && strlen(name)) ? name : "");
+    char entry[96];
+    snprintf(entry, sizeof(entry), "%.20s|%.47s", mac, clean);
+    if (strlen(list) + strlen(entry) + 2 >= WL_BUF) return false;
     if (strlen(list) == 0) {
         whitelist_set(entry);
     } else {
-        char buf[650];
+        char buf[WL_BUF + 128];
         snprintf(buf, sizeof(buf), "%s,%s", list, entry);
         whitelist_set(buf);
     }
+    return true;
 }
 
-/* ---------------- Session auth ---------------- */
+/* ================= Session auth ================= */
 
 static void generate_session_token(char *out, size_t len) {
     static const char hex[] = "0123456789abcdef";
@@ -205,14 +331,13 @@ static void generate_session_token(char *out, size_t len) {
 
 static bool check_session(httpd_req_t *req) {
     if (strlen(s_session_token) == 0) return false;
-    char cookie[128];
+    char cookie[160];
     if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK) return false;
     char needle[64];
     snprintf(needle, sizeof(needle), "session=%s", s_session_token);
     return strstr(cookie, needle) != NULL;
 }
 
-/* For fetch()-based API calls: reply 401 JSON so the page JS can redirect. */
 static esp_err_t require_session_api(httpd_req_t *req) {
     if (check_session(req)) return ESP_OK;
     httpd_resp_set_status(req, "401 Unauthorized");
@@ -221,29 +346,20 @@ static esp_err_t require_session_api(httpd_req_t *req) {
     return ESP_FAIL;
 }
 
-/* ---------------- WiFi ---------------- */
-
-/* Without this, the AP advertises itself (192.168.4.1) as the DNS server to
- * clients. ESP32 doesn't run a DNS resolver, so clients show "connected, no
- * internet" even though NAT works. Fix: hand out the upstream router's DNS. */
-static void dns_setup_task(void *arg) {
-    esp_netif_dns_info_t dns;
-    esp_err_t e = esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
-    if (e == ESP_OK) {
-        esp_netif_dhcps_stop(s_ap_netif);
-        e = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-        ESP_LOGI(TAG, "set_dns_info: %s", esp_err_to_name(e));
-        /* 0x02 = OFFER_DNS bit (raw value; the real header is private to lwip) */
-        uint8_t dhcps_dns_value = 0x02;
-        e = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-                                    &dhcps_dns_value, sizeof(dhcps_dns_value));
-        ESP_LOGI(TAG, "dhcps_option(DNS): %s", esp_err_to_name(e));
-        esp_netif_dhcps_start(s_ap_netif);
-    } else {
-        ESP_LOGW(TAG, "No upstream DNS info yet: %s", esp_err_to_name(e));
+/* compares without leaking where the first mismatch is */
+static bool secure_equal(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    size_t n = la > lb ? la : lb;
+    unsigned char diff = (unsigned char)(la != lb);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
     }
-    vTaskDelete(NULL);
+    return diff == 0;
 }
+
+/* ================= WiFi ================= */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT) {
@@ -254,8 +370,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         case WIFI_EVENT_STA_DISCONNECTED:
             s_sta_connected = false;
             strcpy(s_sta_ip, "0.0.0.0");
-            ESP_LOGW(TAG, "Upstream WiFi disconnected, retrying in 3s...");
-            vTaskDelay(pdMS_TO_TICKS(3000));
+            ESP_LOGW(TAG, "Upstream WiFi disconnected, retrying...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
             break;
         case WIFI_EVENT_AP_STACONNECTED: {
@@ -278,13 +394,38 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         s_sta_connected = true;
-        ESP_LOGI(TAG, "Got upstream IP: %s -- enabling NAT/NAPT", s_sta_ip);
+        ESP_LOGI(TAG, "Upstream IP %s - enabling NAT", s_sta_ip);
         esp_netif_napt_enable(s_ap_netif);
-
-        /* DNS reconfiguration touches the DHCP server, so do it in its own
-         * task with a proper stack instead of the small event-loop stack. */
-        xTaskCreate(dns_setup_task, "dns_setup", 4096, NULL, 5, NULL);
     }
+}
+
+/* AP address + the DNS server that the AP's DHCP server hands to clients.
+ * Without an explicit DNS offer the AP advertises itself as DNS, but the ESP32
+ * runs no resolver - that is the classic "connected, no internet" symptom. */
+static void configure_ap_network(void) {
+    char ip[16], dns[16];
+    get_setting("ap_ip", ip, sizeof(ip));
+    get_setting("dns1", dns, sizeof(dns));
+
+    esp_netif_ip_info_t info = { 0 };
+    info.ip.addr = esp_ip4addr_aton(ip);
+    info.gw.addr = info.ip.addr;
+    info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+
+    esp_netif_dns_info_t dnsinfo = { 0 };
+    dnsinfo.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns);
+    dnsinfo.ip.type = IPADDR_TYPE_V4;
+
+    uint8_t offer_dns = 0x02;   /* OFFER_DNS bit of the (private) lwip dhcps option enum */
+
+    esp_netif_dhcps_stop(s_ap_netif);
+    esp_err_t e1 = esp_netif_set_ip_info(s_ap_netif, &info);
+    esp_err_t e2 = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                                           &offer_dns, sizeof(offer_dns));
+    esp_err_t e3 = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dnsinfo);
+    esp_err_t e4 = esp_netif_dhcps_start(s_ap_netif);
+    ESP_LOGI(TAG, "AP %s, DNS %s (ip:%s opt:%s dns:%s start:%s)", ip, dns,
+             esp_err_to_name(e1), esp_err_to_name(e2), esp_err_to_name(e3), esp_err_to_name(e4));
 }
 
 static void wifi_init(void) {
@@ -294,15 +435,21 @@ static void wifi_init(void) {
     s_ap_netif = esp_netif_create_default_wifi_ap();
     s_sta_netif = esp_netif_create_default_wifi_sta();
 
+    char hostname[40];
+    get_setting("hostname", hostname, sizeof(hostname));
+    esp_netif_set_hostname(s_sta_netif, hostname);
+
+    configure_ap_network();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    char ap_ssid[33], ap_pass[65], sta_ssid[33], sta_pass[65];
-    nvs_get_string("ap_ssid", ap_ssid, sizeof(ap_ssid), DEFAULT_AP_SSID);
-    nvs_get_string("ap_pass", ap_pass, sizeof(ap_pass), DEFAULT_AP_PASS);
+    char ap_ssid[33], ap_pass[65], sta_ssid[33], sta_pass[65], sta_mac[20];
+    get_setting("ap_ssid", ap_ssid, sizeof(ap_ssid));
+    get_setting("ap_pass", ap_pass, sizeof(ap_pass));
+    get_setting("sta_mac", sta_mac, sizeof(sta_mac));
     nvs_get_string("sta_ssid", sta_ssid, sizeof(sta_ssid), "");
     nvs_get_string("sta_pass", sta_pass, sizeof(sta_pass), "");
 
@@ -310,9 +457,10 @@ static void wifi_init(void) {
     strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid));
     ap_config.ap.ssid_len = strlen(ap_ssid);
     strncpy((char *)ap_config.ap.password, ap_pass, sizeof(ap_config.ap.password));
-    ap_config.ap.max_connection = 8;
+    ap_config.ap.max_connection = get_setting_int("ap_max_conn", 1, 10, 8);
+    ap_config.ap.channel = get_setting_int("ap_channel", 1, 13, 1);
+    ap_config.ap.ssid_hidden = get_setting_int("ap_hidden", 0, 1, 0);
     ap_config.ap.authmode = strlen(ap_pass) >= 8 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ap_config.ap.channel = 1;
 
     wifi_config_t sta_config = { 0 };
     strncpy((char *)sta_config.sta.ssid, sta_ssid, sizeof(sta_config.sta.ssid));
@@ -320,185 +468,122 @@ static void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
-    /* If a password shorter than 8 chars ever ends up saved, fall back to
-     * an OPEN network instead of crashing the whole device on boot. */
+    uint8_t mac[6];
+    if (sta_mac[0] != '\0' && parse_mac(sta_mac, mac) && !(mac[0] & 1)) {
+        esp_err_t e = esp_wifi_set_mac(WIFI_IF_STA, mac);
+        ESP_LOGI(TAG, "Custom STA MAC %s: %s", sta_mac, esp_err_to_name(e));
+    }
+
     if (esp_wifi_set_config(WIFI_IF_AP, &ap_config) != ESP_OK) {
-        ESP_LOGW(TAG, "AP password invalid (need 8+ chars) - falling back to OPEN network");
+        ESP_LOGW(TAG, "AP config rejected - falling back to an open network");
         ap_config.ap.authmode = WIFI_AUTH_OPEN;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     }
-
     if (strlen(sta_ssid) > 0) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     }
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "AP up: SSID=%s", ap_ssid);
-    if (strlen(sta_ssid) == 0) {
-        ESP_LOGW(TAG, "No upstream WiFi configured yet. Log in at / then set it under Upstream WiFi.");
+    int dbm = get_setting_int("tx_power", 2, 20, 20);
+    esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
+
+    ESP_LOGI(TAG, "AP up: SSID=%s hostname=%s", ap_ssid, hostname);
+}
+
+/* ================= Hardware reset button (BOOT = GPIO0) =================
+ * Hold ~8 s -> LED starts blinking fast -> release -> settings erased, reboot.
+ * We MUST wait for release before restarting: GPIO0 low at reset means
+ * "enter download mode" and the firmware would not start. */
+
+static void button_task(void *arg) {
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << RESET_BTN_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn);
+    gpio_config_t led = {
+        .pin_bit_mask = 1ULL << LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led);
+    gpio_set_level(LED_GPIO, 0);
+
+    int held_ms = 0;
+    while (1) {
+        if (gpio_get_level(RESET_BTN_GPIO) == 0) {
+            held_ms += 100;
+            if (held_ms >= RESET_HOLD_MS) {
+                ESP_LOGW(TAG, "Factory reset armed - release the button now");
+                int level = 0;
+                while (gpio_get_level(RESET_BTN_GPIO) == 0) {
+                    level = !level;
+                    gpio_set_level(LED_GPIO, level);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                gpio_set_level(LED_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                wipe_settings();
+                ESP_LOGW(TAG, "Settings erased - restarting with defaults");
+                esp_restart();
+            }
+        } else {
+            held_ms = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-/* ---------------- HTML: public landing + login page ---------------- */
+/* ================= HTTP helpers ================= */
 
-static const char LANDING_HTML[] =
-"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Sarfraz Qureshi - WiFi Repeater</title>"
-"<style>"
-"*{box-sizing:border-box}"
-"body{margin:0;min-height:100vh;font-family:sans-serif;"
-"background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);"
-"display:flex;align-items:center;justify-content:center;padding:20px;color:#eee}"
-".wrap{width:100%;max-width:420px}"
-".brand{text-align:center;margin-bottom:22px}"
-".brand .badge{display:inline-block;background:linear-gradient(135deg,#00e0a0,#00a3ff);"
-"width:56px;height:56px;border-radius:16px;line-height:56px;font-size:26px;margin-bottom:10px}"
-".brand h1{font-size:1.25em;margin:4px 0 2px;color:#fff}"
-".brand p{margin:0;color:#9fd8c8;font-size:.9em}"
-"section{background:rgba(20,25,30,.75);backdrop-filter:blur(6px);"
-"border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:22px;"
-"box-shadow:0 8px 30px rgba(0,0,0,.35)}"
-"label{display:block;font-size:.8em;color:#9fb3b0;margin:12px 0 4px}"
-"input{width:100%;padding:11px;border-radius:8px;border:1px solid #33474a;"
-"background:#0f1a1d;color:#eee;font-size:15px}"
-"input:focus{outline:none;border-color:#00e0a0}"
-"button{width:100%;margin-top:18px;padding:12px;border:none;border-radius:8px;"
-"background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;font-weight:bold;"
-"font-size:15px;cursor:pointer}"
-"button:active{opacity:.85}"
-"#err{color:#ff8080;font-size:.85em;min-height:18px;margin-top:8px;text-align:center}"
-"footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.78em}"
-"</style></head><body>"
-"<div class='wrap'>"
-"<div class='brand'>"
-"<div class='badge'>&#128225;</div>"
-"<h1>This WiFi Repeater was built by<br>" BUILDER_NAME "</h1>"
-"<p>Secure Admin Access</p>"
-"</div>"
-"<section>"
-"<label>Username</label><input id='u' autocapitalize='off' placeholder='admin'>"
-"<label>Password</label><input id='p' type='password' placeholder='Password'>"
-"<button onclick='doLogin()'>Login</button>"
-"<div id='err'></div>"
-"</section>"
-"<footer>Firmware crafted with care by " BUILDER_NAME "</footer>"
-"</div>"
-"<script>"
-"async function doLogin(){"
-"  const u=document.getElementById('u').value;"
-"  const p=document.getElementById('p').value;"
-"  const e=document.getElementById('err'); e.textContent='';"
-"  try{"
-"    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},"
-"      body:JSON.stringify({username:u,password:p})});"
-"    const j=await r.json();"
-"    if(j.ok){ location.href='/admin'; } else { e.textContent='Invalid username or password'; }"
-"  }catch(ex){ e.textContent='Could not reach device'; }"
-"}"
-"document.getElementById('p').addEventListener('keydown',ev=>{if(ev.key==='Enter')doLogin();});"
-"</script></body></html>";
+static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buf_len) {
+    int total = 0;
+    while (total < (int)buf_len - 1) {
+        int r = httpd_req_recv(req, buf + total, buf_len - 1 - total);
+        if (r <= 0) break;
+        total += r;
+    }
+    buf[total] = '\0';
+    return ESP_OK;
+}
 
-/* ---------------- HTML: admin dashboard (only after login) ---------------- */
+static esp_err_t send_json(httpd_req_t *req, cJSON *root) {
+    char *out = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t r = httpd_resp_send(req, out ? out : "{}", HTTPD_RESP_USE_STRLEN);
+    free(out);
+    cJSON_Delete(root);
+    return r;
+}
 
-static const char ADMIN_HTML[] =
-"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>" BUILDER_NAME " - Admin</title>"
-"<style>"
-"body{background:#0d0d0d;color:#eee;font-family:sans-serif;margin:0;padding:16px}"
-"h1{color:#00e0a0;font-size:1.3em;border-bottom:1px solid #333;padding-bottom:8px}"
-"h1 small{display:block;color:#7fa79c;font-size:.55em;font-weight:normal;margin-top:4px}"
-"h2{color:#00e0a0;font-size:1em;margin-top:24px}"
-"section{background:#161616;border:1px solid #2a2a2a;border-radius:8px;padding:12px;margin-bottom:14px}"
-"input,button,textarea{background:#1f1f1f;color:#eee;border:1px solid #333;border-radius:6px;padding:8px;margin:4px 0;width:100%;box-sizing:border-box;font-size:14px}"
-"button{background:#00e0a0;color:#0d0d0d;font-weight:bold;cursor:pointer;border:none}"
-"button.danger{background:#e04040;color:#fff}"
-"button.ghost{background:#222;color:#aaa;border:1px solid #333}"
-".row{display:flex;gap:8px}"
-"table{width:100%;border-collapse:collapse;font-size:13px}"
-"td,th{border-bottom:1px solid #2a2a2a;padding:6px;text-align:left}"
-"small{color:#888}"
-"</style></head><body>"
-"<h1>" BUILDER_NAME " &mdash; WiFi Repeater Admin<small>Logged in as admin</small></h1>"
+static esp_err_t send_result(httpd_req_t *req, bool ok, const char *err) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", ok);
+    if (!ok) cJSON_AddStringToObject(r, "error", err ? err : "error");
+    return send_json(req, r);
+}
 
-"<section><h2>Status</h2><div id='status'>Loading...</div></section>"
+static void restart_soon(void) {
+    vTaskDelay(pdMS_TO_TICKS(700));
+    esp_restart();
+}
 
-"<section><h2>Upstream WiFi (network to repeat)</h2>"
-"<input id='sta_ssid' placeholder='Upstream SSID'>"
-"<input id='sta_pass' placeholder='Upstream Password' type='password'>"
-"<button onclick='saveWifi()'>Save &amp; Reboot</button></section>"
-
-"<section><h2>MAC Whitelist</h2><small>Leave empty to allow all devices.</small>"
-"<div id='wl'></div>"
-"<input id='newmac' placeholder='AA:BB:CC:DD:EE:FF'>"
-"<input id='newname' placeholder=\"Device name (e.g. Sarfraz's Phone)\">"
-"<button onclick='addMac()'>Add to Whitelist</button></section>"
-
-"<section><h2>Config Backup</h2>"
-"<div class='row'><button onclick='exportCfg()'>Export JSON</button></div>"
-"<textarea id='importbox' rows='4' placeholder='Paste config JSON here to import'></textarea>"
-"<button onclick='importCfg()'>Import &amp; Reboot</button></section>"
-
-"<section><div class='row'>"
-"<button class='ghost' onclick='logout()'>Logout</button>"
-"<button class='danger' onclick=\"fetch('/api/reboot',{method:'POST'})\">Reboot Device</button>"
-"</div></section>"
-
-"<script>"
-"function authFail(r){ if(r.status===401){ location.href='/'; return true;} return false;}"
-"let loaded=false;"
-"async function refresh(){"
-"  const r=await fetch('/api/status'); if(authFail(r))return; const j=await r.json();"
-"  document.getElementById('status').innerHTML="
-"    'Upstream: '+(j.sta_connected?('Connected ('+j.sta_ip+')'):'Not connected')+"
-"    (j.sta_connected?('<br><b>Remote admin access:</b> http://'+j.sta_ip+'<br><small>Open this from any device on your main router\\'s network to reach this same dashboard.</small>'):'')+"
-"    '<br>Uptime: '+j.uptime_s+'s'+"
-"    '<br>Free heap: '+j.free_heap+' bytes'+"
-"    '<br><table><tr><th>Name</th><th>MAC</th><th>IP</th></tr>'+"
-"      j.clients.map(c=>'<tr><td>'+(c.name||'-')+'</td><td>'+c.mac+'</td><td>'+c.ip+'</td></tr>').join('')+'</table>';"
-"  if(!loaded){ document.getElementById('sta_ssid').value=j.sta_ssid||''; loaded=true; }"
-"  document.getElementById('wl').innerHTML=j.whitelist.map(w=>"
-"    '<div class=row><input readonly value=\"'+(w.name?w.name+' - ':'')+w.mac+'\"><button class=danger onclick=\"rmMac(\\''+w.mac+'\\')\">X</button></div>').join('')||'<small>No restrictions</small>';"
-"}"
-"async function saveWifi(){"
-"  const r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},"
-"    body:JSON.stringify({ssid:document.getElementById('sta_ssid').value,password:document.getElementById('sta_pass').value})});"
-"  if(authFail(r))return;"
-"  alert('Saved. Device is rebooting...');"
-"}"
-"async function addMac(){"
-"  const m=document.getElementById('newmac').value.trim(); if(!m)return;"
-"  const n=document.getElementById('newname').value.trim();"
-"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',mac:m,name:n})});"
-"  if(authFail(r))return;"
-"  document.getElementById('newmac').value=''; document.getElementById('newname').value='';"
-"  refresh();"
-"}"
-"async function rmMac(m){"
-"  const r=await fetch('/api/whitelist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove',mac:m})});"
-"  if(authFail(r))return; refresh();"
-"}"
-"async function exportCfg(){"
-"  const r=await fetch('/api/config/export'); if(authFail(r))return; const t=await r.text();"
-"  document.getElementById('importbox').value=t;"
-"}"
-"async function importCfg(){"
-"  const t=document.getElementById('importbox').value;"
-"  const r=await fetch('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:t});"
-"  if(authFail(r))return;"
-"  alert('Imported. Device is rebooting...');"
-"}"
-"async function logout(){ await fetch('/api/logout',{method:'POST'}); location.href='/'; }"
-"refresh(); setInterval(refresh,5000);"
-"</script></body></html>";
-
-/* ---------------- HTTP handlers ---------------- */
+/* ================= HTTP handlers ================= */
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    /* Public page: always visible, no login required. Shows branding + login form. */
+    if (check_session(req)) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/admin");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, LANDING_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, login_html_start, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -510,19 +595,8 @@ static esp_err_t admin_get_handler(httpd_req_t *req) {
         return ESP_OK;
     }
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, ADMIN_HTML, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static esp_err_t read_body(httpd_req_t *req, char *buf, size_t buf_len) {
-    int total = 0;
-    int r;
-    while (total < (int)buf_len - 1) {
-        r = httpd_req_recv(req, buf + total, buf_len - 1 - total);
-        if (r <= 0) break;
-        total += r;
-    }
-    buf[total] = '\0';
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, admin_html_start, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -534,34 +608,31 @@ static esp_err_t login_post_handler(httpd_req_t *req) {
     if (j) {
         cJSON *user = cJSON_GetObjectItem(j, "username");
         cJSON *pass = cJSON_GetObjectItem(j, "password");
-        char admin_pass[65];
-        nvs_get_string("admin_pass", admin_pass, sizeof(admin_pass), DEFAULT_ADMIN_PASS);
+        char admin_pass[40];
+        get_setting("admin_pass", admin_pass, sizeof(admin_pass));
         if (cJSON_IsString(user) && cJSON_IsString(pass) &&
-            strcmp(user->valuestring, ADMIN_USER) == 0 &&
-            strcmp(pass->valuestring, admin_pass) == 0) {
+            secure_equal(user->valuestring, ADMIN_USER) &&
+            secure_equal(pass->valuestring, admin_pass)) {
             ok = true;
         }
         cJSON_Delete(j);
     }
-    httpd_resp_set_type(req, "application/json");
-    if (ok) {
-        generate_session_token(s_session_token, sizeof(s_session_token));
-        char cookie_hdr[80];
-        snprintf(cookie_hdr, sizeof(cookie_hdr), "session=%s; Path=/; HttpOnly", s_session_token);
-        httpd_resp_set_hdr(req, "Set-Cookie", cookie_hdr);
-        httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    } else {
+    if (!ok) {
+        vTaskDelay(pdMS_TO_TICKS(1000));   /* slows down password guessing */
         httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_send(req, "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+        return send_result(req, false, "wrong password");
     }
-    return ESP_OK;
+    generate_session_token(s_session_token, sizeof(s_session_token));
+    char cookie_hdr[96];
+    snprintf(cookie_hdr, sizeof(cookie_hdr), "session=%s; Path=/; HttpOnly", s_session_token);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie_hdr);
+    return send_result(req, true, NULL);
 }
 
 static esp_err_t logout_post_handler(httpd_req_t *req) {
     s_session_token[0] = '\0';
     httpd_resp_set_hdr(req, "Set-Cookie", "session=; Path=/; Max-Age=0");
-    httpd_resp_send(req, "ok", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+    return send_result(req, true, NULL);
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
@@ -573,24 +644,27 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(root, "uptime_s", (double)((esp_timer_get_time() - s_boot_time_us) / 1000000));
     cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
 
-    char sta_ssid[33];
-    nvs_get_string("sta_ssid", sta_ssid, sizeof(sta_ssid), "");
-    cJSON_AddStringToObject(root, "sta_ssid", sta_ssid);
+    char v[40];
+    nvs_get_string("sta_ssid", v, sizeof(v), "");
+    cJSON_AddStringToObject(root, "sta_ssid", v);
+    get_setting("ap_ip", v, sizeof(v));
+    cJSON_AddStringToObject(root, "ap_ip", v);
 
     cJSON *clients = cJSON_CreateArray();
     wifi_sta_list_t sta_list;
     if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
         esp_netif_pair_mac_ip_t pairs[10] = { 0 };
-        for (int i = 0; i < sta_list.num && i < 10; i++) {
+        int count = sta_list.num > 10 ? 10 : sta_list.num;
+        for (int i = 0; i < count; i++) {
             memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
         }
-        esp_netif_dhcps_get_clients_by_mac(s_ap_netif, sta_list.num, pairs);
+        esp_netif_dhcps_get_clients_by_mac(s_ap_netif, count, pairs);
 
-        for (int i = 0; i < sta_list.num; i++) {
+        for (int i = 0; i < count; i++) {
             char mac[18];
             snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                      sta_list.sta[i].mac[0], sta_list.sta[i].mac[1], sta_list.sta[i].mac[2],
-                      sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
+                     sta_list.sta[i].mac[0], sta_list.sta[i].mac[1], sta_list.sta[i].mac[2],
+                     sta_list.sta[i].mac[3], sta_list.sta[i].mac[4], sta_list.sta[i].mac[5]);
             char ipstr[16];
             snprintf(ipstr, sizeof(ipstr), IPSTR, IP2STR(&pairs[i].ip));
             char name[64] = "";
@@ -606,89 +680,162 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     cJSON_AddItemToObject(root, "clients", clients);
 
     cJSON *wl = cJSON_CreateArray();
-    char list[512];
+    char list[WL_BUF];
     whitelist_get(list, sizeof(list));
     if (strlen(list) > 0) {
         char *copy = strdup(list);
-        char *tok = strtok(copy, ",");
-        while (tok) {
-            while (*tok == ' ') tok++;
-            char m[18], n[64];
-            split_entry(tok, m, sizeof(m), n, sizeof(n));
-            cJSON *e = cJSON_CreateObject();
-            cJSON_AddStringToObject(e, "mac", m);
-            cJSON_AddStringToObject(e, "name", n);
-            cJSON_AddItemToArray(wl, e);
-            tok = strtok(NULL, ",");
+        if (copy) {
+            char *tok = strtok(copy, ",");
+            while (tok) {
+                while (*tok == ' ') tok++;
+                char m[20], n[64];
+                split_entry(tok, m, sizeof(m), n, sizeof(n));
+                cJSON *e = cJSON_CreateObject();
+                cJSON_AddStringToObject(e, "mac", m);
+                cJSON_AddStringToObject(e, "name", n);
+                cJSON_AddItemToArray(wl, e);
+                tok = strtok(NULL, ",");
+            }
+            free(copy);
         }
-        free(copy);
     }
     cJSON_AddItemToObject(root, "whitelist", wl);
-
-    char *out = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
-    free(out);
-    cJSON_Delete(root);
-    return ESP_OK;
+    return send_json(req, root);
 }
 
 static esp_err_t whitelist_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
-    char buf[300];
+    char buf[320];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
-    if (j) {
-        cJSON *action = cJSON_GetObjectItem(j, "action");
-        cJSON *mac = cJSON_GetObjectItem(j, "mac");
-        cJSON *name = cJSON_GetObjectItem(j, "name");
-        if (cJSON_IsString(action) && cJSON_IsString(mac)) {
-            if (strcmp(action->valuestring, "add") == 0)
-                whitelist_add(mac->valuestring, cJSON_IsString(name) ? name->valuestring : "");
-            else if (strcmp(action->valuestring, "remove") == 0)
-                whitelist_remove(mac->valuestring);
+    if (!j) return send_result(req, false, "invalid data");
+
+    cJSON *action = cJSON_GetObjectItem(j, "action");
+    cJSON *mac = cJSON_GetObjectItem(j, "mac");
+    cJSON *name = cJSON_GetObjectItem(j, "name");
+    bool ok = true;
+    const char *err = NULL;
+
+    uint8_t m[6];
+    if (!cJSON_IsString(action) || !cJSON_IsString(mac) || !parse_mac(mac->valuestring, m)) {
+        ok = false;
+        err = "MAC must look like AA:BB:CC:DD:EE:FF";
+    } else {
+        char norm[18];
+        snprintf(norm, sizeof(norm), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+        if (strcmp(action->valuestring, "add") == 0) {
+            if (!whitelist_add(norm, cJSON_IsString(name) ? name->valuestring : "")) {
+                ok = false;
+                err = "whitelist is full";
+            }
+        } else if (strcmp(action->valuestring, "remove") == 0) {
+            whitelist_remove(norm);
         }
-        cJSON_Delete(j);
     }
-    httpd_resp_send(req, "ok", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+    cJSON_Delete(j);
+    return send_result(req, ok, err);
 }
 
 static esp_err_t wifi_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
-    char buf[256];
+    char buf[300];
     read_body(req, buf, sizeof(buf));
     cJSON *j = cJSON_Parse(buf);
-    if (j) {
-        cJSON *ssid = cJSON_GetObjectItem(j, "ssid");
-        cJSON *pass = cJSON_GetObjectItem(j, "password");
+    if (!j) return send_result(req, false, "invalid data");
+
+    cJSON *ssid = cJSON_GetObjectItem(j, "ssid");
+    cJSON *pass = cJSON_GetObjectItem(j, "password");
+    bool ok = true;
+    const char *err = NULL;
+    if (cJSON_IsString(ssid) && strlen(ssid->valuestring) > 32) { ok = false; err = "WiFi name is too long (max 32)"; }
+    if (ok && cJSON_IsString(pass)) {
+        size_t pl = strlen(pass->valuestring);
+        if (pl != 0 && (pl < 8 || pl > 63)) { ok = false; err = "password must be 8-63 characters (blank = open network)"; }
+    }
+    if (ok) {
         if (cJSON_IsString(ssid)) nvs_set_string("sta_ssid", ssid->valuestring);
         if (cJSON_IsString(pass)) nvs_set_string("sta_pass", pass->valuestring);
-        cJSON_Delete(j);
     }
-    httpd_resp_send(req, "ok, rebooting", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    cJSON_Delete(j);
+    send_result(req, ok, err);
+    if (ok) restart_soon();
+    return ESP_OK;
+}
+
+static esp_err_t settings_get_handler(httpd_req_t *req) {
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
+    cJSON *root = cJSON_CreateObject();
+    cJSON *items = cJSON_CreateArray();
+    for (size_t i = 0; i < N_SETTINGS; i++) {
+        char v[80];
+        if (strcmp(SETTINGS[i].type, "password_keep") == 0) v[0] = '\0';
+        else get_setting(SETTINGS[i].key, v, sizeof(v));
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "key", SETTINGS[i].key);
+        cJSON_AddStringToObject(o, "label", SETTINGS[i].label);
+        cJSON_AddStringToObject(o, "type", SETTINGS[i].type);
+        cJSON_AddStringToObject(o, "value", v);
+        cJSON_AddStringToObject(o, "def", SETTINGS[i].def);
+        cJSON_AddStringToObject(o, "hint", SETTINGS[i].hint);
+        cJSON_AddItemToArray(items, o);
+    }
+    cJSON_AddItemToObject(root, "items", items);
+    return send_json(req, root);
+}
+
+static esp_err_t settings_post_handler(httpd_req_t *req) {
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
+    char *buf = malloc(1536);
+    if (!buf) { httpd_resp_send_500(req); return ESP_OK; }
+    read_body(req, buf, 1536);
+    cJSON *j = cJSON_Parse(buf);
+    free(buf);
+    if (!j) return send_result(req, false, "invalid data");
+
+    char err[160] = "";
+    bool ok = true;
+    for (size_t i = 0; i < N_SETTINGS && ok; i++) {
+        cJSON *it = cJSON_GetObjectItem(j, SETTINGS[i].key);
+        if (!cJSON_IsString(it)) continue;
+        if (strcmp(SETTINGS[i].key, "admin_pass") == 0 && it->valuestring[0] == '\0') continue;
+        char why[80] = "";
+        if (!validate_setting(SETTINGS[i].key, it->valuestring, why, sizeof(why))) {
+            snprintf(err, sizeof(err), "%.50s: %.80s", SETTINGS[i].label, why);
+            ok = false;
+        }
+    }
+    if (ok) {
+        for (size_t i = 0; i < N_SETTINGS; i++) {
+            cJSON *it = cJSON_GetObjectItem(j, SETTINGS[i].key);
+            if (!cJSON_IsString(it)) continue;
+            if (strcmp(SETTINGS[i].key, "admin_pass") == 0 && it->valuestring[0] == '\0') continue;
+            nvs_set_string(SETTINGS[i].key, it->valuestring);
+        }
+    }
+    cJSON_Delete(j);
+    send_result(req, ok, err);
+    if (ok) restart_soon();
     return ESP_OK;
 }
 
 static esp_err_t config_export_get_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
     cJSON *root = cJSON_CreateObject();
-    char v[128];
-
-    nvs_get_string("ap_ssid", v, sizeof(v), DEFAULT_AP_SSID); cJSON_AddStringToObject(root, "ap_ssid", v);
-    nvs_get_string("ap_pass", v, sizeof(v), DEFAULT_AP_PASS); cJSON_AddStringToObject(root, "ap_pass", v);
-    nvs_get_string("sta_ssid", v, sizeof(v), ""); cJSON_AddStringToObject(root, "sta_ssid", v);
-    nvs_get_string("sta_pass", v, sizeof(v), ""); cJSON_AddStringToObject(root, "sta_pass", v);
-    nvs_get_string("admin_pass", v, sizeof(v), DEFAULT_ADMIN_PASS); cJSON_AddStringToObject(root, "admin_pass", v);
-    char wl[512];
-    whitelist_get(wl, sizeof(wl));
-    cJSON_AddStringToObject(root, "whitelist", wl);
+    char v[WL_BUF];
+    for (size_t i = 0; i < N_SETTINGS; i++) {
+        get_setting(SETTINGS[i].key, v, sizeof(v));
+        cJSON_AddStringToObject(root, SETTINGS[i].key, v);
+    }
+    nvs_get_string("sta_ssid", v, sizeof(v), "");
+    cJSON_AddStringToObject(root, "sta_ssid", v);
+    nvs_get_string("sta_pass", v, sizeof(v), "");
+    cJSON_AddStringToObject(root, "sta_pass", v);
+    whitelist_get(v, sizeof(v));
+    cJSON_AddStringToObject(root, "whitelist", v);
 
     char *out = cJSON_Print(root);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, out ? out : "{}", HTTPD_RESP_USE_STRLEN);
     free(out);
     cJSON_Delete(root);
     return ESP_OK;
@@ -696,58 +843,86 @@ static esp_err_t config_export_get_handler(httpd_req_t *req) {
 
 static esp_err_t config_import_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
-    char buf[1024];
-    read_body(req, buf, sizeof(buf));
+    char *buf = malloc(3072);
+    if (!buf) { httpd_resp_send_500(req); return ESP_OK; }
+    read_body(req, buf, 3072);
     cJSON *j = cJSON_Parse(buf);
-    if (!j) {
-        httpd_resp_send_500(req);
-        return ESP_OK;
+    free(buf);
+    if (!j) return send_result(req, false, "not valid JSON");
+
+    char err[160] = "";
+    bool ok = true;
+    for (size_t i = 0; i < N_SETTINGS && ok; i++) {
+        cJSON *it = cJSON_GetObjectItem(j, SETTINGS[i].key);
+        if (!cJSON_IsString(it)) continue;
+        char why[80] = "";
+        if (!validate_setting(SETTINGS[i].key, it->valuestring, why, sizeof(why))) {
+            snprintf(err, sizeof(err), "%.50s: %.80s", SETTINGS[i].label, why);
+            ok = false;
+        }
     }
-    const char *keys[] = {"ap_ssid", "ap_pass", "sta_ssid", "sta_pass", "admin_pass", "whitelist"};
-    for (int i = 0; i < 6; i++) {
-        cJSON *item = cJSON_GetObjectItem(j, keys[i]);
-        if (cJSON_IsString(item)) nvs_set_string(keys[i], item->valuestring);
+    cJSON *wl = cJSON_GetObjectItem(j, "whitelist");
+    if (ok && cJSON_IsString(wl) && strlen(wl->valuestring) >= WL_BUF) { ok = false; snprintf(err, sizeof(err), "whitelist too long"); }
+    if (ok) {
+        for (size_t i = 0; i < N_SETTINGS; i++) {
+            cJSON *it = cJSON_GetObjectItem(j, SETTINGS[i].key);
+            if (cJSON_IsString(it)) nvs_set_string(SETTINGS[i].key, it->valuestring);
+        }
+        const char *extra[] = {"sta_ssid", "sta_pass", "whitelist"};
+        for (int i = 0; i < 3; i++) {
+            cJSON *it = cJSON_GetObjectItem(j, extra[i]);
+            if (cJSON_IsString(it) && strlen(it->valuestring) < 200 + (i == 2 ? WL_BUF : 0)) nvs_set_string(extra[i], it->valuestring);
+        }
     }
     cJSON_Delete(j);
-    httpd_resp_send(req, "ok, rebooting", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    send_result(req, ok, err);
+    if (ok) restart_soon();
     return ESP_OK;
 }
 
 static esp_err_t reboot_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
-    httpd_resp_send(req, "rebooting", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    esp_restart();
+    send_result(req, true, NULL);
+    restart_soon();
+    return ESP_OK;
+}
+
+static esp_err_t factory_reset_post_handler(httpd_req_t *req) {
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
+    wipe_settings();
+    send_result(req, true, NULL);
+    restart_soon();
     return ESP_OK;
 }
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 14;
-    config.stack_size = 8192; /* status handler builds JSON + 512B buffers */
+    config.max_uri_handlers = 16;
+    config.stack_size = 8192;
     httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t uris[] = {
-            {.uri = "/", .method = HTTP_GET, .handler = root_get_handler},
-            {.uri = "/admin", .method = HTTP_GET, .handler = admin_get_handler},
-            {.uri = "/api/login", .method = HTTP_POST, .handler = login_post_handler},
-            {.uri = "/api/logout", .method = HTTP_POST, .handler = logout_post_handler},
-            {.uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler},
-            {.uri = "/api/whitelist", .method = HTTP_POST, .handler = whitelist_post_handler},
-            {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post_handler},
-            {.uri = "/api/config/export", .method = HTTP_GET, .handler = config_export_get_handler},
-            {.uri = "/api/config/import", .method = HTTP_POST, .handler = config_import_post_handler},
-            {.uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler},
-        };
-        for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-            httpd_register_uri_handler(server, &uris[i]);
-        }
-        ESP_LOGI(TAG, "Web dashboard started on port 80");
-    } else {
+    if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start web server");
+        return;
     }
+    httpd_uri_t uris[] = {
+        {.uri = "/",                   .method = HTTP_GET,  .handler = root_get_handler},
+        {.uri = "/admin",              .method = HTTP_GET,  .handler = admin_get_handler},
+        {.uri = "/api/login",          .method = HTTP_POST, .handler = login_post_handler},
+        {.uri = "/api/logout",         .method = HTTP_POST, .handler = logout_post_handler},
+        {.uri = "/api/status",         .method = HTTP_GET,  .handler = status_get_handler},
+        {.uri = "/api/whitelist",      .method = HTTP_POST, .handler = whitelist_post_handler},
+        {.uri = "/api/wifi",           .method = HTTP_POST, .handler = wifi_post_handler},
+        {.uri = "/api/settings",       .method = HTTP_GET,  .handler = settings_get_handler},
+        {.uri = "/api/settings",       .method = HTTP_POST, .handler = settings_post_handler},
+        {.uri = "/api/config/export",  .method = HTTP_GET,  .handler = config_export_get_handler},
+        {.uri = "/api/config/import",  .method = HTTP_POST, .handler = config_import_post_handler},
+        {.uri = "/api/reboot",         .method = HTTP_POST, .handler = reboot_post_handler},
+        {.uri = "/api/factory_reset",  .method = HTTP_POST, .handler = factory_reset_post_handler},
+    };
+    for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
+        httpd_register_uri_handler(server, &uris[i]);
+    }
+    ESP_LOGI(TAG, "Web dashboard started on port 80");
 }
 
 void app_main(void) {
@@ -760,6 +935,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    s_boot_time_us = esp_timer_get_time();
     wifi_init();
     start_webserver();
+    xTaskCreate(button_task, "reset_btn", 3072, NULL, 5, NULL);
 }

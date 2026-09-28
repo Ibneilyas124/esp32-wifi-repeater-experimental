@@ -90,3 +90,11 @@ bash flash.sh /dev/ttyUSB0
 | `partitions.csv` | 4MB flash partition layout |
 | `.github/workflows/build.yml` | Builds firmware on GitHub's servers on every push |
 | `flash.sh` | One-command Termux flashing script |
+
+## v2 notes
+- Login: user `Sarfraz` (fixed), default password `admin` (changeable in Advanced Settings)
+- Advanced Settings (all editable, all with defaults): WiFi name/password/hidden/channel/max devices,
+  repeater IP, DNS for clients (default 8.8.8.8), hostname shown in the main router,
+  custom STA MAC, TX power, admin password
+- Hardware reset: hold the BOOT button ~8 s; when the blue LED blinks fast, release
+- Flash `full-flash-padded-0x0.bin` at offset `0x0` (compression OFF, baud 115200) from the Releases page

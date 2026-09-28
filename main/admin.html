@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sarfraz Ibn E Ilyas - Admin</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0d0f10;color:#e8e8e8;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:14px;max-width:760px;margin:auto}
+header{border-bottom:1px solid #2a2f31;padding-bottom:10px;margin-bottom:14px}
+header h1{color:#00e0a0;font-size:1.3em;margin:0}
+header small{color:#7fa79c}
+.card{background:#151819;border:1px solid #262b2d;border-radius:10px;padding:12px;margin-bottom:12px}
+.card h2,summary{color:#00e0a0;font-size:1em;margin:0 0 8px 0;font-weight:600}
+summary{cursor:pointer;margin:0;padding:2px 0;list-style:none}
+summary::-webkit-details-marker{display:none}
+details[open] summary{margin-bottom:10px}
+input,select,button,textarea{background:#1e2224;color:#eee;border:1px solid #33393c;border-radius:6px;padding:9px;margin:3px 0;width:100%;font-size:14px}
+button{background:#00e0a0;color:#08201a;font-weight:700;cursor:pointer;border:none}
+button.danger{background:#e04a4a;color:#fff}
+button.ghost{background:#23282a;color:#bbb;border:1px solid #363c3f}
+button.small{width:auto;padding:5px 10px;font-size:12px}
+.row{display:flex;gap:8px;align-items:center}
+.row>*{flex:1}
+.row>button.small{flex:0 0 auto}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid #202426;font-size:14px}
+.k{color:#8aa7a0}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+td,th{border-bottom:1px solid #262b2d;padding:6px 4px;text-align:left}
+small.h{color:#7d8a88;display:block;margin:0 0 8px 0;font-size:12px}
+label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
+.fld small{color:#7d8a88;font-size:11.5px;display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>Sarfraz Ibn E Ilyas</h1>
+  <small>Ibn e Ilyas Technologies &middot; WiFi Repeater Admin</small>
+</header>
+
+<div class="card"><h2>Status</h2><div id="status">Loading...</div></div>
+
+<div class="card">
+  <h2>Upstream WiFi (network to repeat)</h2>
+  <input id="sta_ssid" placeholder="Upstream WiFi name (2.4 GHz)" autocomplete="off">
+  <input id="sta_pass" type="password" placeholder="Password (blank = keep current; open network if you changed the name)" autocomplete="off">
+  <button onclick="saveWifi()">Save &amp; Reboot</button>
+</div>
+
+<div class="card">
+  <h2>MAC Whitelist</h2>
+  <small class="h">Empty list = every device allowed. Add at least your own device first.</small>
+  <div id="wl"></div>
+  <input id="newmac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
+  <input id="newname" placeholder="Device name (e.g. Ali's phone)" autocomplete="off">
+  <button onclick="addMac()">Add to Whitelist</button>
+</div>
+
+<details class="card" id="adv">
+  <summary>&#9881;&#65039; Advanced Settings (tap to open)</summary>
+  <small class="h">All values below have safe defaults. Change only what you need; device reboots after saving.</small>
+  <div id="sform">Loading...</div>
+  <div class="row">
+    <button class="ghost" onclick="fillDefaults()">Fill defaults</button>
+    <button onclick="saveSettings()">Save &amp; Reboot</button>
+  </div>
+</details>
+
+<details class="card">
+  <summary>&#128190; Config Backup</summary>
+  <button class="ghost" onclick="exportCfg()">Export JSON</button>
+  <textarea id="importbox" rows="5" placeholder="Paste config JSON here to import"></textarea>
+  <button onclick="importCfg()">Import &amp; Reboot</button>
+</details>
+
+<div class="card">
+  <div class="row">
+    <button class="ghost" onclick="logout()">Logout</button>
+    <button class="danger" onclick="reboot()">Reboot</button>
+  </div>
+  <button class="danger" style="margin-top:8px" onclick="factoryReset()">Factory Reset (all settings)</button>
+  <small class="h" style="margin-top:8px">Hardware reset: hold the BOOT button ~8 seconds; when the blue LED starts blinking fast, release it.</small>
+</div>
+
+<script>
+function el(t,a,x){var e=document.createElement(t);if(a)for(var k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;return e;}
+function authFail(r){ if(r.status===401){ location.href='/'; return true; } return false; }
+function fmt(s){ var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return (d?d+'d ':'')+h+'h '+m+'m'; }
+var loaded=false, origSsid='';
+
+async function refresh(){
+  var r=await fetch('/api/status'); if(authFail(r))return; var j=await r.json();
+  var s=document.getElementById('status'); s.textContent='';
+  function line(a,b){ var d=el('div',{'class':'kv'}); d.appendChild(el('span',{'class':'k'},a)); d.appendChild(el('span',null,b)); s.appendChild(d); }
+  line('Upstream', j.sta_connected ? 'Connected ('+j.sta_ip+')' : 'Not connected');
+  if(j.sta_connected) line('Remote admin', 'http://'+j.sta_ip);
+  line('Repeater IP', 'http://'+j.ap_ip);
+  line('Uptime', fmt(j.uptime_s));
+  line('Free memory', Math.round(j.free_heap/1024)+' KB');
+  var t=el('table'); var hr=el('tr'); ['Name','MAC','IP',''].forEach(function(x){hr.appendChild(el('th',null,x));}); t.appendChild(hr);
+  j.clients.forEach(function(c){
+    var tr=el('tr'); tr.appendChild(el('td',null,c.name||'-')); tr.appendChild(el('td',null,c.mac)); tr.appendChild(el('td',null,c.ip));
+    var td=el('td'); var b=el('button',{'class':'small ghost'},'+WL'); b.onclick=function(){ document.getElementById('newmac').value=c.mac; document.getElementById('newname').focus(); };
+    td.appendChild(b); tr.appendChild(td); t.appendChild(tr);
+  });
+  s.appendChild(el('div',{'class':'k','style':'margin-top:8px'},'Connected devices ('+j.clients.length+')')); s.appendChild(t);
+  if(!loaded){ origSsid=j.sta_ssid||''; document.getElementById('sta_ssid').value=origSsid; loaded=true; }
+  var wl=document.getElementById('wl'); wl.textContent='';
+  if(!j.whitelist.length){ wl.appendChild(el('small',{'class':'h'},'No restrictions')); }
+  j.whitelist.forEach(function(w){
+    var row=el('div',{'class':'row'}); var i=el('input',{'readonly':'readonly'}); i.value=(w.name?w.name+' - ':'')+w.mac;
+    var b=el('button',{'class':'small danger'},'X'); b.onclick=function(){ rmMac(w.mac); };
+    row.appendChild(i); row.appendChild(b); wl.appendChild(row);
+  });
+}
+
+async function post(url,obj){
+  var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});
+  if(authFail(r)) return null; try{ return await r.json(); }catch(e){ return {ok:true}; }
+}
+async function saveWifi(){
+  var ns=document.getElementById('sta_ssid').value;
+  var o={ssid:ns};
+  var p=document.getElementById('sta_pass').value;
+  if(p) o.password=p; else if(ns!==origSsid) o.password='';   /* new network + blank = open network */
+  var j=await post('/api/wifi',o); if(j) alert(j.ok===false?('Error: '+j.error):'Saved. Repeater is rebooting...');
+}
+async function addMac(){
+  var m=document.getElementById('newmac').value.trim(); if(!m) return;
+  var j=await post('/api/whitelist',{action:'add',mac:m,name:document.getElementById('newname').value.trim()});
+  if(j&&j.ok===false){ alert(j.error); return; }
+  document.getElementById('newmac').value=''; document.getElementById('newname').value=''; refresh();
+}
+async function rmMac(m){ var j=await post('/api/whitelist',{action:'remove',mac:m}); if(j) refresh(); }
+
+async function loadSettings(){
+  var r=await fetch('/api/settings'); if(authFail(r))return; var j=await r.json();
+  var box=document.getElementById('sform'); box.textContent='';
+  j.items.forEach(function(it){
+    var d=el('div',{'class':'fld'}); var inp;
+    if(it.type==='bool'){ inp=el('select'); [['0','No'],['1','Yes']].forEach(function(o){ var op=el('option',{value:o[0]},o[1]); inp.appendChild(op); }); inp.value=it.value; }
+    else { inp=el('input'); inp.type=(it.type==='password'||it.type==='password_keep')?'password':(it.type==='number'?'number':'text'); inp.value=it.value; if(it.type==='password_keep') inp.placeholder='(leave blank to keep current)'; }
+    inp.setAttribute('data-key',it.key); inp.setAttribute('data-def',it.def); inp.setAttribute('data-type',it.type); inp.setAttribute('autocomplete','off');
+    d.appendChild(el('label',null,it.label)); d.appendChild(inp); d.appendChild(el('small',null,it.hint+' | default: '+(it.def===''?'(blank)':it.def)));
+    box.appendChild(d);
+  });
+}
+function fillDefaults(){
+  document.querySelectorAll('#sform [data-key]').forEach(function(e){ if(e.getAttribute('data-type')!=='password_keep') e.value=e.getAttribute('data-def'); });
+}
+async function saveSettings(){
+  var o={}; document.querySelectorAll('#sform [data-key]').forEach(function(e){ o[e.getAttribute('data-key')]=e.value; });
+  var j=await post('/api/settings',o); if(!j) return;
+  alert(j.ok?'Saved. Repeater is rebooting - reconnect to its WiFi (use the new name/password if you changed them).':('Not saved: '+j.error));
+}
+async function exportCfg(){ var r=await fetch('/api/config/export'); if(authFail(r))return; document.getElementById('importbox').value=await r.text(); }
+async function importCfg(){
+  var r=await fetch('/api/config/import',{method:'POST',headers:{'Content-Type':'application/json'},body:document.getElementById('importbox').value});
+  if(authFail(r))return; var j=await r.json(); alert(j.ok?'Imported. Repeater is rebooting...':('Import failed: '+j.error));
+}
+async function reboot(){ if(confirm('Reboot the repeater now?')) await post('/api/reboot'); }
+async function factoryReset(){ if(confirm('Erase ALL settings and return to defaults?')){ await post('/api/factory_reset'); alert('Reset done. Repeater is rebooting with default settings.'); } }
+async function logout(){ await post('/api/logout'); location.href='/'; }
+
+refresh(); loadSettings(); setInterval(refresh,5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ibn e Ilyas Technologies - WiFi Repeater</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);display:flex;align-items:center;
+justify-content:center;padding:20px;color:#eee}
+.wrap{width:100%;max-width:420px}
+.brand{text-align:center;margin-bottom:22px}
+.badge{display:inline-block;background:linear-gradient(135deg,#00e0a0,#00a3ff);width:58px;height:58px;
+border-radius:16px;line-height:58px;font-size:28px;margin-bottom:10px}
+.brand h1{font-size:1.2em;margin:4px 0 2px;color:#fff;line-height:1.35}
+.brand p{margin:0;color:#9fd8c8;font-size:.9em}
+section{background:rgba(20,25,30,.78);border:1px solid rgba(255,255,255,.08);border-radius:14px;
+padding:22px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+label{display:block;font-size:.8em;color:#9fb3b0;margin:12px 0 4px}
+input{width:100%;padding:12px;border-radius:8px;border:1px solid #33474a;background:#0f1a1d;color:#eee;font-size:15px}
+input[readonly]{color:#7fd9bd;background:#0c1416}
+input:focus{outline:none;border-color:#00e0a0}
+button{width:100%;margin-top:18px;padding:13px;border:none;border-radius:8px;
+background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;font-weight:bold;font-size:15px;cursor:pointer}
+button:active{opacity:.85}
+#err{color:#ff8080;font-size:.85em;min-height:18px;margin-top:10px;text-align:center}
+footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.78em}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="badge">&#128225;</div>
+    <h1>This WiFi Repeater was built by<br>Sarfraz Qureshi</h1>
+    <p>Ibn e Ilyas Technologies &middot; Secure Admin Access</p>
+  </div>
+  <section>
+    <label>Username</label>
+    <input id="u" value="Sarfraz" readonly>
+    <label>Password</label>
+    <input id="p" type="password" placeholder="Enter admin password" autofocus>
+    <button onclick="doLogin()">Login</button>
+    <div id="err"></div>
+  </section>
+  <footer>Firmware crafted with care by Sarfraz Qureshi</footer>
+</div>
+<script>
+async function doLogin(){
+  const e=document.getElementById('err'); e.textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
+    const j=await r.json();
+    if(j.ok){ location.href='/admin'; } else { e.textContent='Wrong password'; }
+  }catch(x){ e.textContent='Could not reach the repeater'; }
+}
+document.getElementById('p').addEventListener('keydown',function(ev){ if(ev.key==='Enter') doLogin(); });
+</script>
+</body>
+</html>

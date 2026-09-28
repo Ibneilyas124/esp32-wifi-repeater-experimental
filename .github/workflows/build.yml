@@ -31,7 +31,10 @@ jobs:
             0x1000 build/bootloader/bootloader.bin \
             0x8000 build/partition_table/partition-table.bin \
             0x10000 build/esp32-wifi-repeater.bin
-          head -c 16384 /dev/zero | tr '\000' '\377' >> out/full-flash-0x0.bin
+          # Padded copy for flaky Android flashers: random bytes do not compress away,
+          # so the real image tail always gets written.
+          cp out/full-flash-0x0.bin out/full-flash-padded-0x0.bin
+          head -c 131072 /dev/urandom >> out/full-flash-padded-0x0.bin
           ls -l out/
 
       - name: Upload firmware artifacts
@@ -44,6 +47,7 @@ jobs:
             build/esp32-wifi-repeater.bin
             build/flasher_args.json
             out/full-flash-0x0.bin
+            out/full-flash-padded-0x0.bin
 
       - name: Create GitHub Release with binaries
         if: github.ref == 'refs/heads/main'
@@ -56,5 +60,6 @@ jobs:
             build/partition_table/partition-table.bin
             build/esp32-wifi-repeater.bin
             out/full-flash-0x0.bin
+            out/full-flash-padded-0x0.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
