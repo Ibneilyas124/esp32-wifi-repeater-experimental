@@ -414,7 +414,7 @@ static void configure_ap_network(void) {
 
     esp_netif_dns_info_t dnsinfo = { 0 };
     dnsinfo.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns);
-    dnsinfo.ip.type = IPADDR_TYPE_V4;
+    dnsinfo.ip.type = ESP_IPADDR_TYPE_V4;
 
     uint8_t offer_dns = 0x02;   /* OFFER_DNS bit of the (private) lwip dhcps option enum */
 
