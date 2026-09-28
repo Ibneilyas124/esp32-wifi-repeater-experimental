@@ -25,7 +25,19 @@ button{width:100%;margin-top:18px;padding:13px;border:none;border-radius:8px;
 background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;font-weight:bold;font-size:15px;cursor:pointer}
 button:active{opacity:.85}
 #err{color:#ff8080;font-size:.85em;min-height:18px;margin-top:10px;text-align:center}
-footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.78em}
+footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.85em}
+footer a{color:#7fd9bd;text-decoration:none}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;padding:16px;z-index:9}
+.modal.on{display:flex}
+.mbox{background:#141b1e;border:1px solid #2c4a50;border-radius:14px;max-width:420px;width:100%;max-height:92vh;overflow:auto;padding:20px;position:relative}
+.mbox h2{margin:0 0 4px;color:#00e0a0;font-size:1.15em}
+.mbox h3{margin:14px 0 6px;color:#9fd8c8;font-size:.95em}
+.mbox .nm{font-size:1.3em;font-weight:700;margin-bottom:8px}
+.mbox p{margin:5px 0;font-size:.92em;word-break:break-word}
+.mbox a{color:#7fd9bd}
+.mbox ul{margin:0;padding-left:18px;font-size:.92em;line-height:1.6}
+.mbox .q{margin-top:14px;font-style:italic;color:#c9e7df;text-align:center}
+.mclose{position:absolute;top:8px;right:12px;background:none;border:none;color:#aaa;font-size:24px;cursor:pointer;width:auto;margin:0;padding:0}
 </style>
 </head>
 <body>
@@ -43,9 +55,32 @@ footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.78em}
     <button onclick="doLogin()">Login</button>
     <div id="err"></div>
   </section>
-  <footer>Firmware crafted with care by Sarfraz Qureshi</footer>
+  <footer><a href="#" onclick="openAbout();return false">About Developer</a> &nbsp;&middot;&nbsp; <a href="/tools">&#128295; WiFi Tools (no login)</a></footer>
+</div>
+
+<div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
+  <div class="mbox">
+    <button class="mclose" onclick="closeAbout()">&times;</button>
+    <h2>About Developer</h2>
+    <div class="nm">Sarfraz Qureshi</div>
+    <p>&#128205; Naushehro Feroz, Sindh, Pakistan</p>
+    <p>&#128231; <a href="mailto:ahmedsarfraz650@gmail.com">ahmedsarfraz650@gmail.com</a></p>
+    <p>&#128172; WhatsApp: <a href="https://wa.me/923043478576">+92 304 3478576</a></p>
+    <p>&#127760; GitHub: <a href="https://github.com/Ibneilyas124">Ibneilyas124</a></p>
+    <h3>Skills</h3>
+    <ul>
+      <li>Arduino &amp; Embedded Systems</li>
+      <li>Circuit Design, Soldering &amp; Programming</li>
+      <li>Hardware &amp; Software Troubleshooting</li>
+      <li>IoT &amp; Wi-Fi Projects</li>
+      <li>Cybersecurity</li>
+    </ul>
+    <div class="q">&ldquo;Build it. Break it. Fix it. Learn from it.&rdquo;</div>
+  </div>
 </div>
 <script>
+function openAbout(){document.getElementById('about').classList.add('on');}
+function closeAbout(){document.getElementById('about').classList.remove('on');}
 async function doLogin(){
   const e=document.getElementById('err'); e.textContent='';
   try{

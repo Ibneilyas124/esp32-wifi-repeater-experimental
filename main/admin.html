@@ -35,7 +35,7 @@ label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
 <body>
 <header>
   <h1>Sarfraz Ibn E Ilyas</h1>
-  <small>Ibn e Ilyas Technologies &middot; WiFi Repeater Admin</small>
+  <small>Ibn e Ilyas Technologies &middot; WiFi Repeater Admin &middot; <a href="/tools" style="color:#7fd9bd">&#128295; WiFi Tools</a> <span id="fw"></span></small>
 </header>
 
 <div class="card"><h2>Status</h2><div id="status">Loading...</div></div>
@@ -95,15 +95,21 @@ async function refresh(){
   line('Upstream', j.sta_connected ? 'Connected ('+j.sta_ip+')' : 'Not connected');
   if(j.sta_connected) line('Remote admin', 'http://'+j.sta_ip);
   line('Repeater IP', 'http://'+j.ap_ip);
+  line('Guest mode', j.wl_active ? 'Active - non-whitelisted devices can join but get no internet' : 'Off (whitelist empty or disabled)');
   line('Uptime', fmt(j.uptime_s));
   line('Free memory', Math.round(j.free_heap/1024)+' KB');
-  var t=el('table'); var hr=el('tr'); ['Name','MAC','IP',''].forEach(function(x){hr.appendChild(el('th',null,x));}); t.appendChild(hr);
+  var t=el('table'); var hr=el('tr'); ['Name','MAC','IP','Signal','Internet',''].forEach(function(x){hr.appendChild(el('th',null,x));}); t.appendChild(hr);
   j.clients.forEach(function(c){
     var tr=el('tr'); tr.appendChild(el('td',null,c.name||'-')); tr.appendChild(el('td',null,c.mac)); tr.appendChild(el('td',null,c.ip));
+    tr.appendChild(el('td',null,c.rssi+' dBm'));
+    tr.appendChild(el('td',{'style':'color:'+(c.authorized?'#00e0a0':'#ffb14a')},c.authorized?'Allowed':'Guest (blocked)'));
     var td=el('td'); var b=el('button',{'class':'small ghost'},'+WL'); b.onclick=function(){ document.getElementById('newmac').value=c.mac; document.getElementById('newname').focus(); };
-    td.appendChild(b); tr.appendChild(td); t.appendChild(tr);
+    var k=el('button',{'class':'small danger'},'Kick'); k.onclick=function(){ kick(c.mac); };
+    td.appendChild(b); td.appendChild(document.createTextNode(' ')); td.appendChild(k); tr.appendChild(td); t.appendChild(tr);
   });
-  s.appendChild(el('div',{'class':'k','style':'margin-top:8px'},'Connected devices ('+j.clients.length+')')); s.appendChild(t);
+  var wrap=el('div',{'style':'overflow-x:auto'}); wrap.appendChild(t);
+  s.appendChild(el('div',{'class':'k','style':'margin-top:8px'},'Connected devices ('+j.clients.length+')')); s.appendChild(wrap);
+  document.getElementById('fw').textContent='v'+j.fw;
   if(!loaded){ origSsid=j.sta_ssid||''; document.getElementById('sta_ssid').value=origSsid; loaded=true; }
   var wl=document.getElementById('wl'); wl.textContent='';
   if(!j.whitelist.length){ wl.appendChild(el('small',{'class':'h'},'No restrictions')); }
@@ -131,6 +137,7 @@ async function addMac(){
   if(j&&j.ok===false){ alert(j.error); return; }
   document.getElementById('newmac').value=''; document.getElementById('newname').value=''; refresh();
 }
+async function kick(m){ if(!confirm('Disconnect '+m+' now?')) return; var j=await post('/api/kick',{mac:m}); if(j&&j.ok===false) alert(j.error); setTimeout(refresh,1500); }
 async function rmMac(m){ var j=await post('/api/whitelist',{action:'remove',mac:m}); if(j) refresh(); }
 
 async function loadSettings(){

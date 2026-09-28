@@ -24,9 +24,6 @@
 #include "esp_random.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
-#include "esp_private/wifi.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
 #include "esp_timer.h"
 #include "esp_http_server.h"
 #include "nvs_flash.h"
@@ -46,9 +43,6 @@ static const char *TAG = "repeater";
 /* HTML pages embedded from login.html / admin.html (see main/CMakeLists.txt) */
 extern const char login_html_start[] asm("_binary_login_html_start");
 extern const char admin_html_start[] asm("_binary_admin_html_start");
-extern const char tools_html_start[] asm("_binary_tools_html_start");
-
-#define FW_VERSION "2.1.0"
 
 static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_sta_netif = NULL;
@@ -56,19 +50,6 @@ static bool s_sta_connected = false;
 static char s_sta_ip[16] = "0.0.0.0";
 static int64_t s_boot_time_us = 0;
 static char s_session_token[40] = "";
-static uint32_t s_subnet_base = 0, s_subnet_mask = 0;
-static volatile bool s_guest_filter_on = true;
-
-/* ---- deauth monitor ring buffer ---- */
-#define DEAUTH_RING 24
-typedef struct { int64_t t; uint8_t type; uint8_t src[6]; uint8_t dst[6]; int8_t rssi; bool ours; } deauth_evt_t;
-static deauth_evt_t s_deauth_ring[DEAUTH_RING];
-static volatile int s_deauth_head = 0, s_deauth_count = 0, s_deauth_total = 0;
-
-/* ---- background scan / diagnose state ---- */
-static volatile int s_scan_state = 0;    /* 0 idle/done, 1 running, 2 error */
-static volatile int s_diag_state = 0;    /* 0 idle, 1 running, 2 done */
-static cJSON *s_diag_result = NULL;
 
 /* ================= Settings table (single source of truth) ================= */
 
@@ -91,9 +72,6 @@ static const setting_t SETTINGS[] = {
     {"hostname",   "Name shown in main router",        "Ibn-e-Ilyas-Technologies", "text",          "1-32 characters. Letters, digits and hyphen work best on routers"},
     {"sta_mac",    "Custom MAC toward main router",    "",                         "text",          "Blank = factory MAC. Format AA:BB:CC:DD:EE:FF, first byte must be even"},
     {"tx_power",   "Transmit power (dBm)",             "20",                       "number",        "2-20. Lower it if the device overheats"},
-    {"guest_filter","Guests: connect but no internet",  "1",                        "bool",          "1 = wrong-listed devices can join & reach this page but get no internet. 0 = they get disconnected immediately"},
-    {"deauth_monitor","Deauth attack monitor",          "1",                        "bool",          "Passively watches for deauth/disassoc floods nearby. See WiFi Tools > Deauth"},
-    {"deauth_alert","Deauth alert threshold",           "10",                       "number",        "Frames in 10s that count as an attack (1-50)"},
     {"admin_pass", "Admin password",                   "admin",                    "password_keep", "4-32 characters. Leave blank to keep the current one"},
 };
 #define N_SETTINGS (sizeof(SETTINGS) / sizeof(SETTINGS[0]))
@@ -207,10 +185,6 @@ static bool validate_setting(const char *key, const char *v, char *err, size_t n
         }
     } else if (strcmp(key, "tx_power") == 0) {
         if (!int_in_range(v, 2, 20)) { snprintf(err, n, "must be 2-20"); return false; }
-    } else if (strcmp(key, "guest_filter") == 0 || strcmp(key, "deauth_monitor") == 0) {
-        if (strcmp(v, "0") != 0 && strcmp(v, "1") != 0) { snprintf(err, n, "must be 0 or 1"); return false; }
-    } else if (strcmp(key, "deauth_alert") == 0) {
-        if (!int_in_range(v, 1, 50)) { snprintf(err, n, "must be 1-50"); return false; }
     } else if (strcmp(key, "admin_pass") == 0) {
         if (len < 4 || len > 32) { snprintf(err, n, "must be 4-32 characters"); return false; }
     }
@@ -387,94 +361,6 @@ static bool secure_equal(const char *a, const char *b) {
 
 /* ================= WiFi ================= */
 
-/* ---- Guest packet filter: unauthorized clients keep local access (DHCP,
- * ARP, the admin/tools page at the repeater's own IP) but every packet bound
- * OUTSIDE the local subnet - i.e. anything that would be NAT'd to the
- * internet - is dropped before it ever reaches the IP stack. Whitelisted
- * clients are untouched and behave exactly as before. This only runs when
- * "guest_filter" is on AND the whitelist is not empty (an empty whitelist
- * still means "allow everyone fully", unchanged from earlier versions). */
-
-static void update_subnet_cache(void) {
-    char ip[16];
-    get_setting("ap_ip", ip, sizeof(ip));
-    s_subnet_mask = esp_ip4addr_aton("255.255.255.0");
-    s_subnet_base = esp_ip4addr_aton(ip) & s_subnet_mask;
-}
-
-static esp_err_t ap_rx_filter(void *buffer, uint16_t len, void *eb) {
-    if (!s_guest_filter_on || len < 14) {
-        esp_netif_receive(s_ap_netif, buffer, len, eb);
-        return ESP_OK;
-    }
-    uint8_t *f = (uint8_t *)buffer;
-    char mac[18];
-    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", f[6], f[7], f[8], f[9], f[10], f[11]);
-    if (whitelist_contains(mac)) {
-        esp_netif_receive(s_ap_netif, buffer, len, eb);
-        return ESP_OK;
-    }
-    uint16_t ethertype = ((uint16_t)f[12] << 8) | f[13];
-    bool allow = false;
-    if (ethertype == 0x0806) {
-        allow = true; /* ARP - keeps local networking alive, never reaches the internet */
-    } else if (ethertype == 0x0800 && len >= 34) {
-        uint32_t dest;
-        memcpy(&dest, f + 30, 4); /* IPv4 destination address */
-        if (dest == 0xFFFFFFFFu || (dest & s_subnet_mask) == s_subnet_base) allow = true;
-    }
-    if (allow) {
-        esp_netif_receive(s_ap_netif, buffer, len, eb);
-    } else {
-        esp_wifi_internal_free_rx_buffer(eb);
-    }
-    return ESP_OK;
-}
-
-/* ---- Deauth / disassoc monitor: passive promiscuous management-frame sniff.
- * Adds counters only, never transmits anything itself. */
-
-static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (type != WIFI_PKT_MGMT) return;
-    wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    if (pkt->rx_ctrl.sig_len < 24) return;
-    uint8_t *p = pkt->payload;
-    uint8_t fc0 = p[0];
-    uint8_t ftype = (fc0 >> 2) & 0x03;
-    uint8_t subtype = (fc0 >> 4) & 0x0F;
-    if (ftype != 0 || (subtype != 0x0C && subtype != 0x0A)) return; /* mgmt: deauth=0xC, disassoc=0xA */
-
-    uint8_t *addr1 = p + 4, *addr2 = p + 10, *addr3 = p + 16;
-    uint8_t self_ap[6] = {0}, self_sta[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_AP, self_ap);
-    esp_wifi_get_mac(WIFI_IF_STA, self_sta);
-    bool ours = (memcmp(addr1, self_ap, 6) == 0) || (memcmp(addr3, self_ap, 6) == 0) ||
-                (memcmp(addr1, self_sta, 6) == 0) || (memcmp(addr3, self_sta, 6) == 0);
-
-    int idx = s_deauth_head;
-    s_deauth_ring[idx].t = esp_timer_get_time();
-    s_deauth_ring[idx].type = subtype;
-    memcpy(s_deauth_ring[idx].src, addr2, 6);
-    memcpy(s_deauth_ring[idx].dst, addr1, 6);
-    s_deauth_ring[idx].rssi = pkt->rx_ctrl.rssi;
-    s_deauth_ring[idx].ours = ours;
-    s_deauth_head = (s_deauth_head + 1) % DEAUTH_RING;
-    if (s_deauth_count < DEAUTH_RING) s_deauth_count++;
-    s_deauth_total++;
-}
-
-static void deauth_monitor_apply(bool on) {
-    if (on) {
-        wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
-        esp_wifi_set_promiscuous_filter(&filt);
-        esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_cb);
-        esp_wifi_set_promiscuous(true);
-    } else {
-        esp_wifi_set_promiscuous(false);
-    }
-}
-
-
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT) {
         switch (id) {
@@ -494,12 +380,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                      ev->mac[0], ev->mac[1], ev->mac[2], ev->mac[3], ev->mac[4], ev->mac[5]);
             if (!whitelist_contains(mac)) {
-                if (s_guest_filter_on) {
-                    ESP_LOGI(TAG, "Guest connected (local access only, no internet): %s", mac);
-                } else {
-                    ESP_LOGW(TAG, "Rejecting non-whitelisted client %s", mac);
-                    esp_wifi_deauth_sta(ev->aid);
-                }
+                ESP_LOGW(TAG, "Rejecting non-whitelisted client %s", mac);
+                esp_wifi_deauth_sta(ev->aid);
             } else {
                 ESP_LOGI(TAG, "Client connected: %s", mac);
             }
@@ -521,7 +403,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
  * Without an explicit DNS offer the AP advertises itself as DNS, but the ESP32
  * runs no resolver - that is the classic "connected, no internet" symptom. */
 static void configure_ap_network(void) {
-    update_subnet_cache();
     char ip[16], dns[16];
     get_setting("ap_ip", ip, sizeof(ip));
     get_setting("dns1", dns, sizeof(dns));
@@ -533,7 +414,7 @@ static void configure_ap_network(void) {
 
     esp_netif_dns_info_t dnsinfo = { 0 };
     dnsinfo.ip.u_addr.ip4.addr = esp_ip4addr_aton(dns);
-    dnsinfo.ip.type = ESP_IPADDR_TYPE_V4;
+    dnsinfo.ip.type = IPADDR_TYPE_V4;
 
     uint8_t offer_dns = 0x02;   /* OFFER_DNS bit of the (private) lwip dhcps option enum */
 
@@ -605,14 +486,6 @@ static void wifi_init(void) {
 
     int dbm = get_setting_int("tx_power", 2, 20, 20);
     esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
-
-    char gf[4]; get_setting("guest_filter", gf, sizeof(gf));
-    s_guest_filter_on = (gf[0] == '1');
-    esp_err_t rxe = esp_wifi_internal_reg_rxcb(WIFI_IF_AP, ap_rx_filter);
-    ESP_LOGI(TAG, "Guest filter %s (rxcb: %s)", s_guest_filter_on ? "ON" : "OFF", esp_err_to_name(rxe));
-
-    char dm[4]; get_setting("deauth_monitor", dm, sizeof(dm));
-    deauth_monitor_apply(dm[0] == '1');
 
     ESP_LOGI(TAG, "AP up: SSID=%s hostname=%s", ap_ssid, hostname);
 }
@@ -766,7 +639,6 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "fw", FW_VERSION);
     cJSON_AddBoolToObject(root, "sta_connected", s_sta_connected);
     cJSON_AddStringToObject(root, "sta_ip", s_sta_ip);
     cJSON_AddNumberToObject(root, "uptime_s", (double)((esp_timer_get_time() - s_boot_time_us) / 1000000));
@@ -777,10 +649,6 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(root, "sta_ssid", v);
     get_setting("ap_ip", v, sizeof(v));
     cJSON_AddStringToObject(root, "ap_ip", v);
-
-    char wlfull[WL_BUF];
-    whitelist_get(wlfull, sizeof(wlfull));
-    cJSON_AddBoolToObject(root, "wl_active", strlen(wlfull) > 0);
 
     cJSON *clients = cJSON_CreateArray();
     wifi_sta_list_t sta_list;
@@ -806,8 +674,6 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
             cJSON_AddStringToObject(c, "mac", mac);
             cJSON_AddStringToObject(c, "ip", ipstr);
             cJSON_AddStringToObject(c, "name", name);
-            cJSON_AddNumberToObject(c, "rssi", sta_list.sta[i].rssi);
-            cJSON_AddBoolToObject(c, "authorized", whitelist_contains(mac));
             cJSON_AddItemToArray(clients, c);
         }
     }
@@ -1014,323 +880,6 @@ static esp_err_t config_import_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* ================= Kick / identity ================= */
-
-static esp_err_t kick_post_handler(httpd_req_t *req) {
-    if (require_session_api(req) != ESP_OK) return ESP_OK;
-    char buf[64];
-    read_body(req, buf, sizeof(buf));
-    cJSON *j = cJSON_Parse(buf);
-    bool ok = false;
-    const char *err = "invalid data";
-    if (j) {
-        cJSON *mac = cJSON_GetObjectItem(j, "mac");
-        uint8_t m[6];
-        if (cJSON_IsString(mac) && parse_mac(mac->valuestring, m)) {
-            uint16_t aid = 0;
-            if (esp_wifi_ap_get_sta_aid(m, &aid) == ESP_OK && aid > 0) {
-                esp_wifi_deauth_sta(aid);
-                ok = true;
-            } else {
-                err = "device is not currently connected";
-            }
-        } else {
-            err = "MAC must look like AA:BB:CC:DD:EE:FF";
-        }
-        cJSON_Delete(j);
-    }
-    return send_result(req, ok, ok ? NULL : err);
-}
-
-static esp_err_t me_get_handler(httpd_req_t *req) {
-    cJSON *r = cJSON_CreateObject();
-    cJSON_AddBoolToObject(r, "admin", check_session(req));
-    return send_json(req, r);
-}
-
-static esp_err_t tools_get_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, tools_html_start, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-/* ================= WiFi Analyzer (scan) ================= */
-
-static void scan_task(void *arg) {
-    wifi_scan_config_t cfg = { .ssid = NULL, .bssid = NULL, .channel = 0, .show_hidden = true, .scan_type = WIFI_SCAN_TYPE_ACTIVE };
-    esp_err_t e = esp_wifi_scan_start(&cfg, true);
-    s_scan_state = (e == ESP_OK) ? 0 : 2;
-    vTaskDelete(NULL);
-}
-
-static esp_err_t scan_start_post_handler(httpd_req_t *req) {
-    if (s_scan_state != 1) {
-        s_scan_state = 1;
-        xTaskCreate(scan_task, "scan", 4096, NULL, 4, NULL);
-    }
-    return send_result(req, true, NULL);
-}
-
-static const char *auth_name(wifi_auth_mode_t a) {
-    switch (a) {
-        case WIFI_AUTH_OPEN: return "Open";
-        case WIFI_AUTH_WEP: return "WEP";
-        case WIFI_AUTH_WPA_PSK: return "WPA";
-        case WIFI_AUTH_WPA2_PSK: return "WPA2";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
-        case WIFI_AUTH_WPA3_PSK: return "WPA3";
-        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
-        default: return "WPA2+";
-    }
-}
-
-static esp_err_t scan_get_handler(httpd_req_t *req) {
-    if (s_scan_state == 1) { cJSON *r = cJSON_CreateObject(); cJSON_AddStringToObject(r, "state", "scanning"); return send_json(req, r); }
-    if (s_scan_state == 2) { cJSON *r = cJSON_CreateObject(); cJSON_AddStringToObject(r, "state", "error"); cJSON_AddStringToObject(r, "error", "scan failed - try again"); return send_json(req, r); }
-
-    uint16_t num = 0;
-    esp_wifi_scan_get_ap_num(&num);
-    if (num > 40) num = 40;
-    wifi_ap_record_t *recs = num ? calloc(num, sizeof(wifi_ap_record_t)) : NULL;
-    if (num && !recs) { httpd_resp_send_500(req); return ESP_OK; }
-    if (num) esp_wifi_scan_get_ap_records(&num, recs);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "state", "done");
-    uint8_t cur_ch = 0; wifi_second_chan_t sc;
-    esp_wifi_get_channel(&cur_ch, &sc);
-    cJSON_AddNumberToObject(root, "cur_ch", cur_ch);
-
-    char apssid[33]; get_setting("ap_ssid", apssid, sizeof(apssid));
-    cJSON_AddStringToObject(root, "ap_ssid", apssid);
-    uint8_t apmac[6] = {0}; esp_wifi_get_mac(WIFI_IF_AP, apmac);
-    char apmacs[18]; snprintf(apmacs, sizeof(apmacs), "%02X:%02X:%02X:%02X:%02X:%02X", apmac[0], apmac[1], apmac[2], apmac[3], apmac[4], apmac[5]);
-    cJSON_AddStringToObject(root, "ap_bssid", apmacs);
-    if (s_sta_connected) {
-        wifi_ap_record_t up;
-        if (esp_wifi_sta_get_ap_info(&up) == ESP_OK) {
-            char ubssid[18]; snprintf(ubssid, sizeof(ubssid), "%02X:%02X:%02X:%02X:%02X:%02X", up.bssid[0], up.bssid[1], up.bssid[2], up.bssid[3], up.bssid[4], up.bssid[5]);
-            cJSON_AddStringToObject(root, "up_bssid", ubssid);
-        }
-    }
-
-    cJSON *nets = cJSON_CreateArray();
-    for (int i = 0; i < num; i++) {
-        wifi_ap_record_t *r = &recs[i];
-        cJSON *n = cJSON_CreateObject();
-        cJSON_AddStringToObject(n, "ssid", (const char *)r->ssid);
-        char bssid[18]; snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X", r->bssid[0], r->bssid[1], r->bssid[2], r->bssid[3], r->bssid[4], r->bssid[5]);
-        cJSON_AddStringToObject(n, "bssid", bssid);
-        cJSON_AddNumberToObject(n, "ch", r->primary);
-        cJSON_AddNumberToObject(n, "rssi", r->rssi);
-        cJSON_AddStringToObject(n, "auth", auth_name(r->authmode));
-        cJSON_AddNumberToObject(n, "bw", r->second != WIFI_SECOND_CHAN_NONE ? 40 : 20);
-        cJSON_AddBoolToObject(n, "b", r->phy_11b);
-        cJSON_AddBoolToObject(n, "g", r->phy_11g);
-        cJSON_AddBoolToObject(n, "n", r->phy_11n);
-        cJSON_AddBoolToObject(n, "lr", r->phy_lr);
-        cJSON_AddBoolToObject(n, "wps", r->wps);
-        if (r->country.cc[0]) { char cc[3] = { r->country.cc[0], r->country.cc[1], 0 }; cJSON_AddStringToObject(n, "cc", cc); }
-        cJSON_AddItemToArray(nets, n);
-    }
-    cJSON_AddItemToObject(root, "nets", nets);
-    free(recs);
-    return send_json(req, root);
-}
-
-/* ================= Deauth monitor readout ================= */
-
-static esp_err_t deauth_get_handler(httpd_req_t *req) {
-    char v[4]; get_setting("deauth_monitor", v, sizeof(v));
-    bool enabled = (v[0] == '1');
-    int thr = get_setting_int("deauth_alert", 1, 50, 10);
-    int64_t now = esp_timer_get_time();
-    int c10 = 0, b10 = 0, o10 = 0;
-    int n = s_deauth_count;
-
-    cJSON *events = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) {
-        int idx = ((s_deauth_head - 1 - i) % DEAUTH_RING + DEAUTH_RING) % DEAUTH_RING;
-        deauth_evt_t *e = &s_deauth_ring[idx];
-        double age = (double)(now - e->t) / 1e6;
-        if (age <= 10.0) {
-            c10++;
-            if (memcmp(e->dst, "\xff\xff\xff\xff\xff\xff", 6) == 0) b10++;
-            if (e->ours) o10++;
-        }
-        if (i < 15) {
-            char sm[18], dm[18];
-            snprintf(sm, sizeof(sm), "%02X:%02X:%02X:%02X:%02X:%02X", e->src[0], e->src[1], e->src[2], e->src[3], e->src[4], e->src[5]);
-            snprintf(dm, sizeof(dm), "%02X:%02X:%02X:%02X:%02X:%02X", e->dst[0], e->dst[1], e->dst[2], e->dst[3], e->dst[4], e->dst[5]);
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddNumberToObject(o, "age", (int)age);
-            cJSON_AddStringToObject(o, "type", e->type == 0x0C ? "deauth" : "disassoc");
-            cJSON_AddStringToObject(o, "src", sm);
-            cJSON_AddStringToObject(o, "dst", dm);
-            cJSON_AddNumberToObject(o, "rssi", e->rssi);
-            cJSON_AddBoolToObject(o, "ours", e->ours);
-            cJSON_AddItemToArray(events, o);
-        }
-    }
-
-    const char *level = "ok";
-    if (enabled) {
-        if (c10 >= thr) level = "attack";
-        else if (c10 >= (thr / 3 + 1)) level = "watch";
-    }
-
-    uint8_t ch = 0; wifi_second_chan_t sc;
-    esp_wifi_get_channel(&ch, &sc);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "enabled", enabled);
-    cJSON_AddStringToObject(root, "level", level);
-    cJSON_AddNumberToObject(root, "count10", c10);
-    cJSON_AddNumberToObject(root, "bcast10", b10);
-    cJSON_AddNumberToObject(root, "ours10", o10);
-    cJSON_AddBoolToObject(root, "targets_us", o10 > 0);
-    cJSON_AddNumberToObject(root, "total", s_deauth_total);
-    cJSON_AddNumberToObject(root, "thr", thr);
-    cJSON_AddNumberToObject(root, "channel", ch);
-    cJSON_AddItemToObject(root, "events", events);
-    return send_json(req, root);
-}
-
-/* ================= Speed test ================= */
-
-static esp_err_t ping_get_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "pong", 4);
-    return ESP_OK;
-}
-
-static esp_err_t speed_get_handler(httpd_req_t *req) {
-    char qs[64] = "", kbs[16] = "256";
-    if (httpd_req_get_url_query_str(req, qs, sizeof(qs)) == ESP_OK) {
-        httpd_query_key_value(qs, "kb", kbs, sizeof(kbs));
-    }
-    int kb = atoi(kbs);
-    if (kb <= 0 || kb > 4096) kb = 256;
-
-    static char chunk[4096];
-    memset(chunk, 'A', sizeof(chunk));
-    httpd_resp_set_type(req, "application/octet-stream");
-    int remaining = kb * 1024;
-    while (remaining > 0) {
-        int n = remaining > (int)sizeof(chunk) ? (int)sizeof(chunk) : remaining;
-        if (httpd_resp_send_chunk(req, chunk, n) != ESP_OK) break;
-        remaining -= n;
-    }
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-
-static esp_err_t upspeed_post_handler(httpd_req_t *req) {
-    char buf[1024];
-    int remaining = req->content_len;
-    while (remaining > 0) {
-        int n = httpd_req_recv(req, buf, remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining);
-        if (n <= 0) break;
-        remaining -= n;
-    }
-    return send_result(req, true, NULL);
-}
-
-/* ================= Diagnose ================= */
-
-static int tcp_probe(const char *ip, int port, int timeout_ms) {
-    int64_t t0 = esp_timer_get_time();
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock < 0) return -1;
-    struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    struct sockaddr_in addr = { 0 };
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(ip);
-    int r = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    close(sock);
-    if (r != 0) return -1;
-    return (int)((esp_timer_get_time() - t0) / 1000);
-}
-
-static void diag_task(void *arg) {
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "connected", s_sta_connected);
-    if (s_sta_connected) {
-        wifi_ap_record_t info;
-        if (esp_wifi_sta_get_ap_info(&info) == ESP_OK) {
-            cJSON_AddStringToObject(root, "ssid", (const char *)info.ssid);
-            cJSON_AddNumberToObject(root, "rssi", info.rssi);
-            cJSON_AddNumberToObject(root, "channel", info.primary);
-        }
-        cJSON_AddStringToObject(root, "ip", s_sta_ip);
-
-        esp_netif_ip_info_t ipi = { 0 };
-        esp_netif_get_ip_info(s_sta_netif, &ipi);
-        char gw[16]; snprintf(gw, sizeof(gw), IPSTR, IP2STR(&ipi.gw));
-        cJSON_AddStringToObject(root, "gw_ip", gw);
-        int gwms = tcp_probe(gw, 80, 800);
-        cJSON_AddStringToObject(root, "gw", gwms >= 0 ? "ok" : "refused");
-        cJSON_AddNumberToObject(root, "gw_ms", gwms >= 0 ? gwms : 0);
-
-        cJSON *inet = cJSON_CreateArray();
-        const char *hosts[2] = { "1.1.1.1", "8.8.8.8" };
-        for (int i = 0; i < 2; i++) {
-            int ms = tcp_probe(hosts[i], 443, 1500);
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "host", hosts[i]);
-            cJSON_AddBoolToObject(o, "ok", ms >= 0);
-            cJSON_AddNumberToObject(o, "ms", ms >= 0 ? ms : 0);
-            cJSON_AddItemToArray(inet, o);
-        }
-        cJSON_AddItemToObject(root, "inet", inet);
-
-        int64_t d0 = esp_timer_get_time();
-        struct hostent *he = gethostbyname("google.com");
-        int dms = (int)((esp_timer_get_time() - d0) / 1000);
-        if (he && he->h_addr_list && he->h_addr_list[0]) {
-            uint8_t *a = (uint8_t *)he->h_addr_list[0];
-            char dip[16]; snprintf(dip, sizeof(dip), "%d.%d.%d.%d", a[0], a[1], a[2], a[3]);
-            cJSON_AddBoolToObject(root, "dns_ok", true);
-            cJSON_AddStringToObject(root, "dns_ip", dip);
-            cJSON_AddNumberToObject(root, "dns_ms", dms);
-        } else {
-            cJSON_AddBoolToObject(root, "dns_ok", false);
-        }
-    }
-    char dns[16]; get_setting("dns1", dns, sizeof(dns));
-    cJSON_AddStringToObject(root, "client_dns", dns);
-    cJSON_AddStringToObject(root, "state", "done");
-
-    if (s_diag_result) cJSON_Delete(s_diag_result);
-    s_diag_result = root;
-    s_diag_state = 2;
-    vTaskDelete(NULL);
-}
-
-static esp_err_t diag_start_post_handler(httpd_req_t *req) {
-    if (s_diag_state != 1) {
-        s_diag_state = 1;
-        xTaskCreate(diag_task, "diag", 6144, NULL, 4, NULL);
-    }
-    return send_result(req, true, NULL);
-}
-
-static esp_err_t diag_get_handler(httpd_req_t *req) {
-    if (s_diag_state != 2 || !s_diag_result) {
-        cJSON *r = cJSON_CreateObject();
-        cJSON_AddStringToObject(r, "state", s_diag_state == 1 ? "running" : "idle");
-        return send_json(req, r);
-    }
-    char *out = cJSON_PrintUnformatted(s_diag_result);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, out ? out : "{}", HTTPD_RESP_USE_STRLEN);
-    free(out);
-    return ESP_OK;
-}
-
 static esp_err_t reboot_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
     send_result(req, true, NULL);
@@ -1348,7 +897,7 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 16;
     config.stack_size = 8192;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -1369,17 +918,6 @@ static void start_webserver(void) {
         {.uri = "/api/config/import",  .method = HTTP_POST, .handler = config_import_post_handler},
         {.uri = "/api/reboot",         .method = HTTP_POST, .handler = reboot_post_handler},
         {.uri = "/api/factory_reset",  .method = HTTP_POST, .handler = factory_reset_post_handler},
-        {.uri = "/api/kick",           .method = HTTP_POST, .handler = kick_post_handler},
-        {.uri = "/api/me",             .method = HTTP_GET,  .handler = me_get_handler},
-        {.uri = "/tools",              .method = HTTP_GET,  .handler = tools_get_handler},
-        {.uri = "/api/scan/start",     .method = HTTP_POST, .handler = scan_start_post_handler},
-        {.uri = "/api/scan",           .method = HTTP_GET,  .handler = scan_get_handler},
-        {.uri = "/api/deauth",         .method = HTTP_GET,  .handler = deauth_get_handler},
-        {.uri = "/api/ping",           .method = HTTP_GET,  .handler = ping_get_handler},
-        {.uri = "/api/speed",          .method = HTTP_GET,  .handler = speed_get_handler},
-        {.uri = "/api/upspeed",        .method = HTTP_POST, .handler = upspeed_post_handler},
-        {.uri = "/api/diag/start",     .method = HTTP_POST, .handler = diag_start_post_handler},
-        {.uri = "/api/diag",           .method = HTTP_GET,  .handler = diag_get_handler},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Tools - Ibn e Ilyas Technologies</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0d0f10;color:#e8e8e8;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:14px;max-width:820px;margin:auto}
+header{border-bottom:1px solid #2a2f31;padding-bottom:10px;margin-bottom:12px}
+header h1{color:#00e0a0;font-size:1.25em;margin:0}
+header small{color:#7fa79c}
+a{color:#7fd9bd}
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.tabs button{flex:1;min-width:90px;background:#1b1f21;color:#aab;border:1px solid #2c3234;border-radius:8px;padding:9px 6px;font-size:13px;cursor:pointer}
+.tabs button.on{background:#00e0a0;color:#08201a;font-weight:700;border-color:#00e0a0}
+.card{background:#151819;border:1px solid #262b2d;border-radius:10px;padding:12px;margin-bottom:12px}
+.card h2{color:#00e0a0;font-size:1em;margin:0 0 8px 0}
+button.act{background:#00e0a0;color:#08201a;font-weight:700;border:none;border-radius:8px;padding:11px;width:100%;font-size:14px;cursor:pointer}
+button.act:disabled{opacity:.5}
+button.ghost{background:#23282a;color:#ccc;border:1px solid #363c3f;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer}
+select{background:#1e2224;color:#eee;border:1px solid #33393c;border-radius:6px;padding:7px}
+small.h{color:#7d8a88;display:block;margin:4px 0;font-size:12px}
+.net{border:1px solid #262b2d;border-radius:9px;padding:9px;margin-top:8px;background:#121516}
+.net .t{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.net .n{font-weight:600;font-size:15px;word-break:break-all}
+.net .m{font-size:12px;color:#93a3a0;margin-top:4px;line-height:1.55}
+.tag{display:inline-block;font-size:11px;border-radius:4px;padding:1px 6px;margin-right:4px;background:#23292b;color:#b8c8c5}
+.tag.bad{background:#4a1f1f;color:#ff9c9c}.tag.warn{background:#463414;color:#ffc46b}.tag.ok{background:#12382b;color:#7ff0c0}.tag.me{background:#1d3550;color:#8cc8ff}
+.bar{height:6px;border-radius:3px;background:#22282a;margin-top:6px;overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#e04a4a,#f0c040,#00e0a0)}
+.chart{display:flex;align-items:flex-end;gap:3px;height:110px;margin-top:8px}
+.chart div{flex:1;text-align:center;font-size:10px;color:#8aa;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
+.chart div i{display:block;background:#2d8f76;border-radius:3px 3px 0 0;min-height:2px}
+.chart div.cur i{background:#4aa3ff}
+.chart div.best i{background:#f0c040}
+.pill{border-radius:20px;padding:10px 14px;font-weight:700;text-align:center;margin-bottom:8px}
+.pill.ok{background:#12382b;color:#7ff0c0}.pill.watch{background:#463414;color:#ffc46b}.pill.attack{background:#4a1f1f;color:#ff9c9c}
+.big{font-size:1.7em;font-weight:700;color:#00e0a0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.box{background:#121516;border:1px solid #262b2d;border-radius:8px;padding:8px;text-align:center}
+.box span{display:block;color:#8aa;font-size:11px}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+td,th{border-bottom:1px solid #262b2d;padding:5px 3px;text-align:left}
+.step{padding:7px 0;border-bottom:1px solid #202426;font-size:14px}
+.step b{display:inline-block;width:22px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128295; WiFi Tools</h1>
+  <small>Ibn e Ilyas Technologies &middot; no login needed &middot; <a href="/">Admin login</a></small>
+</header>
+
+<div class="tabs">
+  <button id="tb-an" class="on" onclick="showTab('an')">&#128246; Analyzer</button>
+  <button id="tb-de" onclick="showTab('de')">&#128737; Deauth</button>
+  <button id="tb-sp" onclick="showTab('sp')">&#9889; Speed</button>
+  <button id="tb-dg" onclick="showTab('dg')">&#129658; Diagnose</button>
+</div>
+
+<!-- ============ ANALYZER ============ -->
+<div id="p-an">
+  <div class="card">
+    <h2>WiFi Analyzer</h2>
+    <small class="h">Scans nearby networks (including hidden ones: name blank, BSSID still shown). The repeater's WiFi pauses for a few seconds while scanning.</small>
+    <button class="act" id="scanBtn" onclick="startScan()">Scan now</button>
+    <div id="scanMsg" class="h" style="margin-top:6px"></div>
+  </div>
+  <div id="scanOut" hidden>
+    <div class="card"><h2>Channel congestion (2.4 GHz)</h2><div id="chart" class="chart"></div><small class="h" id="chartNote"></small></div>
+    <div class="card" id="warnCard" hidden><h2>&#9888;&#65039; Warnings</h2><div id="warns"></div></div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <h2 style="margin:0" id="netCount">Networks</h2>
+        <select id="sortBy" onchange="renderNets()"><option value="rssi">Strongest first</option><option value="ch">By channel</option><option value="name">By name</option></select>
+      </div>
+      <div id="nets"></div>
+      <button class="ghost" style="margin-top:10px" onclick="lookupOnline()">Look up unknown vendors online</button>
+      <small class="h" id="onlineMsg"></small>
+    </div>
+  </div>
+</div>
+
+<!-- ============ DEAUTH ============ -->
+<div id="p-de" hidden>
+  <div class="card">
+    <h2>Deauthentication attack monitor</h2>
+    <div id="dePill" class="pill ok">Loading...</div>
+    <div class="grid" id="deStats"></div>
+    <small class="h">The repeater passively listens for deauth / disassoc frames on <b>its own channel</b> (frames sent by anyone nearby). A flood of them - especially to broadcast - is the signature of a deauth attack. Attacks on other channels cannot be seen. No traffic is sent by this tool.</small>
+    <div id="deEvents"></div>
+  </div>
+</div>
+
+<!-- ============ SPEED ============ -->
+<div id="p-sp" hidden>
+  <div class="card">
+    <h2>Speed test</h2>
+    <small class="h">Test 1 measures your phone &harr; repeater WiFi link. Test 2 measures real internet speed through the repeater (needs internet access and a whitelisted device).</small>
+    <button class="act" id="spBtn" onclick="runSpeed()">Start test</button>
+    <div class="grid" style="margin-top:10px">
+      <div class="box"><span>Repeater latency</span><div class="big" id="r_ping">-</div></div>
+      <div class="box"><span>Repeater jitter</span><div class="big" id="r_jit">-</div></div>
+      <div class="box"><span>Link download (Mbps)</span><div class="big" id="r_dn">-</div></div>
+      <div class="box"><span>Link upload (Mbps)</span><div class="big" id="r_up">-</div></div>
+      <div class="box"><span>Internet latency</span><div class="big" id="i_ping">-</div></div>
+      <div class="box"><span>Internet jitter</span><div class="big" id="i_jit">-</div></div>
+      <div class="box"><span>Internet download (Mbps)</span><div class="big" id="i_dn">-</div></div>
+      <div class="box"><span>Internet upload (Mbps)</span><div class="big" id="i_up">-</div></div>
+    </div>
+    <small class="h" id="spMsg"></small>
+  </div>
+</div>
+
+<!-- ============ DIAGNOSE ============ -->
+<div id="p-dg" hidden>
+  <div class="card">
+    <h2>Internet diagnosis</h2>
+    <small class="h">Checks step by step: upstream WiFi, gateway, internet reachability and DNS, then tells you what to fix.</small>
+    <button class="act" id="dgBtn" onclick="runDiag()">Run diagnosis</button>
+    <div id="dgOut" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<script>
+function $(i){return document.getElementById(i);}
+function el(t,a,x){var e=document.createElement(t);if(a)for(var k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;return e;}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+var isAdmin=false, deTimer=null;
+fetch('/api/me').then(function(r){return r.json();}).then(function(j){isAdmin=!!j.admin;}).catch(function(){});
+
+function showTab(id){
+  ['an','de','sp','dg'].forEach(function(t){ $('p-'+t).hidden=(t!==id); $('tb-'+t).className=(t===id?'on':''); });
+  if(deTimer){clearInterval(deTimer);deTimer=null;}
+  if(id==='de'){ loadDeauth(); deTimer=setInterval(loadDeauth,3000); }
+}
+
+/* ---------- Vendor lookup (offline list of common router/AP makers) ---------- */
+var OUI={};
+function add(v,l){ l.split(' ').forEach(function(p){ if(p) OUI[p]=v; }); }
+add('TP-Link','50C7BF F4F26D EC086B 14CC20 14CF92 98DAC4 A0F3C1 C46E1F D807B6 E894F6 30B5C2 1C3BF3 54C80F 60E327 90F652 AC84C6 B04E26 C025E9 F81A67 18D6C7');
+add('Huawei','00E0FC 001882 001E10 00259E 00464B 04F938 101B54 20F3A3 346BD3 4846FB 548998 78F557 80FB06 8853D4 ACE215 D46E5C E0247F F4C714');
+add('ZTE','0015EB 0019C6 001E73 002293 002512 0026ED 344B50 4C09B4 5422F8 C864C7 D476EA FCC897');
+add('Tenda','C83A35 0495E6 502B73');
+add('D-Link','001195 001346 0015E9 001B11 001CF0 001E58 002191 0022B0 00265A 14D64D 1C7EE5 28107B 340804 5CD998 78542E 84C9B2 9094E4 B8A386 C0A0BB C8BE19 CCB255 F07D68');
+add('Netgear','000FB5 00095B 001B2F 001E2A 001F33 00223F 0024B2 20E52A 2C3033 6CB0CE 9C3DCF A040A0 B03956 C03F0E E091F5 10DA43 9CD36D C40415');
+add('ASUS','000C6E 000EA6 00112F 0011D8 0013D4 0015F2 001731 0018F3 001A92 001BFC 001D60 001E8C 001FC6 002215 002354 00248C 002618 00E018 08606E 1C872C 2C56DC 305A3A 3497F6 38D547 50465D 54A050 60A44C 74D02B AC220B BCEE7B D850E6 E03F49 F46D04 F832E4');
+add('Xiaomi','009EC8 0C1DAF 14F65A 28E31F 34CE00 640980 68DFDD 7451BA 8CBEBE 9C99A0 A086C6 ACF7F3 F0B429 F48B32 F8A45F FC64BA');
+add('Ubiquiti','00156D 002722 0418D6 18E829 24A43C 44D9E7 68D79A 74ACB9 788A20 802AA8 B4FBE4 DC9FDB E063DA F09FC2 FCECDA');
+add('MikroTik','000C42 2CC81B 488F5A 4C5E0C 64D154 6C3B6B 744D28 B869F4 C4AD34 CC2DE0 D401C3 D4CA6D DC2C6E E48D8C');
+add('Linksys/Cisco','000C41 000E08 000F66 001217 001310 0014BF 0016B6 001839 0018F8 001A70 001C10 001D7E 001EE5 002129 00226B 002369 00259C 20AA4B 48F8B3 586D8F C0C1C0 C8D719 00000C');
+add('Espressif (ESP32/ESP8266 device)','240AC4 30AEA4 840D8E 7C9EBD A4CF12 246F28 3C71BF 807D3A B4E62D C44F33 DC4F22 ECFABC 083AF2 10521C 349454 4C11AE 58BF25 686725 84F3EB 8CAAB5 94B97E 98CDAC A020A6 AC67B2 B8F009 BCDDC2 CC50E3 D8A01D E8DB84 F4CFA2 FCF5C4');
+add('Realtek (chipset)','00E04C');
+add('MediaTek/Ralink (chipset)','000C43');
+add('Broadcom (chipset)','001018');
+add('Qualcomm/Atheros (chipset)','00037F 001374');
+function vendorOf(mac){
+  var h=mac.replace(/[^0-9A-Fa-f]/g,'').toUpperCase(); if(h.length<6) return 'Unknown';
+  var b0=parseInt(h.substr(0,2),16), key=h.substr(0,6);
+  if(OUI[key]) return OUI[key];
+  if(b0&2){
+    var k2=('0'+(b0&~2).toString(16).toUpperCase()).slice(-2)+h.substr(2,4);
+    if(OUI[k2]) return OUI[k2]+' (virtual/guest SSID)';
+    return 'Private / virtual MAC';
+  }
+  return 'Unknown';
+}
+function isUnknown(v){ return v==='Unknown'; }
+
+/* ---------- Analyzer ---------- */
+var scanData=null;
+async function startScan(){
+  var b=$('scanBtn'); b.disabled=true; $('scanMsg').textContent='Scanning... your WiFi may pause for a few seconds.';
+  try{
+    await fetch('/api/scan/start',{method:'POST'});
+    for(var i=0;i<30;i++){
+      await sleep(1300);
+      var r=await fetch('/api/scan',{cache:'no-store'}); var j=await r.json();
+      if(j.state==='done'){ scanData=j; $('scanMsg').textContent='Scan complete.'; showScan(); break; }
+      if(j.state==='error'){ $('scanMsg').textContent='Scan failed: '+(j.error||'unknown'); break; }
+    }
+  }catch(e){ $('scanMsg').textContent='Lost connection during the scan - reconnect and try again.'; }
+  b.disabled=false;
+}
+function secClass(a){ if(a==='Open') return 'bad'; if(a==='WEP') return 'bad'; if(a==='WPA') return 'warn'; return 'ok'; }
+function showScan(){
+  $('scanOut').hidden=false;
+  var nets=scanData.nets; var sc=[]; for(var c=0;c<=14;c++) sc.push(0);
+  nets.forEach(function(n){ var w=Math.max(1,n.rssi+100); for(var c=1;c<=13;c++){ var ov=Math.max(0,1-Math.abs(c-n.ch)/4); sc[c]+=ov*w; } });
+  var mx=1,best=1; for(var c=1;c<=13;c++){ if(sc[c]>mx) mx=sc[c]; if(sc[c]<sc[best]) best=c; }
+  var ch=$('chart'); ch.textContent='';
+  for(var c=1;c<=13;c++){
+    var d=el('div',{'class':(c===scanData.cur_ch?'cur':(c===best?'best':''))}); var i=el('i'); i.style.height=Math.max(2,Math.round(sc[c]/mx*90))+'px';
+    d.appendChild(i); d.appendChild(document.createTextNode(c)); ch.appendChild(d);
+  }
+  var hid=nets.filter(function(n){return !n.ssid;}).length;
+  $('chartNote').textContent='Blue = repeater channel ('+scanData.cur_ch+'), yellow = least crowded ('+best+'). While the repeater is connected to an upstream router it must use the router\'s channel.';
+  $('netCount').textContent=nets.length+' networks ('+hid+' hidden)';
+  /* warnings */
+  var warns=[]; var bySsid={};
+  nets.forEach(function(n){ if(n.ssid){ (bySsid[n.ssid]=bySsid[n.ssid]||[]).push(n); } });
+  for(var s in bySsid){ var l=bySsid[s]; var open=l.some(function(x){return x.auth==='Open';}), sec=l.some(function(x){return x.auth!=='Open';}); if(open&&sec) warns.push('"'+s+'" appears both open and protected - possible fake (evil twin) access point.'); }
+  nets.forEach(function(n){ if(scanData.ap_ssid && n.ssid===scanData.ap_ssid && n.bssid.toUpperCase()!==scanData.ap_bssid.toUpperCase()) warns.push('Another device is broadcasting YOUR repeater name "'+n.ssid+'" ('+n.bssid+') - possible evil twin.'); });
+  var wl=nets.filter(function(n){return n.auth==='Open'||n.auth==='WEP';}).length; if(wl) warns.push(wl+' nearby network(s) use Open/WEP security (weak).');
+  $('warnCard').hidden=warns.length===0; var w=$('warns'); w.textContent=''; warns.forEach(function(t){ w.appendChild(el('div',{'class':'step'},t)); });
+  renderNets();
+}
+function renderNets(){
+  if(!scanData) return; var list=scanData.nets.slice(); var m=$('sortBy').value;
+  list.sort(function(a,b){ if(m==='ch') return a.ch-b.ch||b.rssi-a.rssi; if(m==='name') return (a.ssid||'~').localeCompare(b.ssid||'~'); return b.rssi-a.rssi; });
+  var box=$('nets'); box.textContent='';
+  list.forEach(function(n){
+    var v=n.vendor||(n.vendor=vendorOf(n.bssid));
+    var card=el('div',{'class':'net'}); var t=el('div',{'class':'t'});
+    t.appendChild(el('div',{'class':'n'},n.ssid||'(hidden network)'));
+    t.appendChild(el('div',{'class':'m'},n.rssi+' dBm'));
+    card.appendChild(t);
+    var bar=el('div',{'class':'bar'}); var bi=el('i'); bi.style.width=Math.max(4,Math.min(100,2*(n.rssi+100)))+'%'; bar.appendChild(bi); card.appendChild(bar);
+    var m2=el('div',{'class':'m'});
+    m2.appendChild(el('span',{'class':'tag '+secClass(n.auth)},n.auth));
+    m2.appendChild(el('span',{'class':'tag'},'CH '+n.ch));
+    m2.appendChild(el('span',{'class':'tag'},n.bw+' MHz'));
+    var ph=[]; if(n.b) ph.push('b'); if(n.g) ph.push('g'); if(n.n) ph.push('n'); if(n.lr) ph.push('LR'); if(ph.length) m2.appendChild(el('span',{'class':'tag'},'802.11 '+ph.join('/')));
+    if(n.wps) m2.appendChild(el('span',{'class':'tag warn'},'WPS'));
+    if(n.cc) m2.appendChild(el('span',{'class':'tag'},n.cc));
+    if(scanData.ap_bssid && n.bssid.toUpperCase()===scanData.ap_bssid.toUpperCase()) m2.appendChild(el('span',{'class':'tag me'},'this repeater'));
+    if(scanData.up_bssid && n.bssid.toUpperCase()===scanData.up_bssid.toUpperCase()) m2.appendChild(el('span',{'class':'tag me'},'connected upstream'));
+    card.appendChild(m2);
+    card.appendChild(el('div',{'class':'m'},'BSSID '+n.bssid+' \u2022 '+v));
+    if(isAdmin){ var b=el('button',{'class':'ghost','style':'margin-top:6px'},'Use as upstream'); b.onclick=function(){ useUpstream(n); }; card.appendChild(b); }
+    box.appendChild(card);
+  });
+}
+async function useUpstream(n){
+  var ssid=n.ssid; if(!ssid){ ssid=prompt('This network is hidden. Enter its exact name:'); if(!ssid) return; }
+  var pw=''; if(n.auth!=='Open'){ pw=prompt('WiFi password for "'+ssid+'" (8-63 characters):'); if(pw===null) return; }
+  if(!confirm('Connect the repeater to "'+ssid+'"? It will reboot.')) return;
+  var r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid,password:pw})});
+  var j=await r.json(); alert(j.ok===false?('Error: '+j.error):'Saved. The repeater is rebooting - reconnect to its WiFi in ~20 s.');
+}
+async function lookupOnline(){
+  if(!scanData) return; var todo=scanData.nets.filter(function(n){return isUnknown(vendorOf(n.bssid));}).slice(0,10);
+  if(!todo.length){ $('onlineMsg').textContent='Nothing unknown to look up.'; return; }
+  var done=0;
+  for(var i=0;i<todo.length;i++){
+    try{ var r=await fetch('https://api.macvendors.com/'+encodeURIComponent(todo[i].bssid)); if(r.ok){ todo[i].vendor=(await r.text()).trim(); done++; } }catch(e){ $('onlineMsg').textContent='Online lookup unavailable (no internet or blocked by the browser).'; renderNets(); return; }
+    $('onlineMsg').textContent='Looked up '+(i+1)+'/'+todo.length+'...'; await sleep(1200);
+  }
+  $('onlineMsg').textContent='Done ('+done+' found).'; renderNets();
+}
+
+/* ---------- Deauth monitor ---------- */
+async function loadDeauth(){
+  try{
+    var r=await fetch('/api/deauth',{cache:'no-store'}); var j=await r.json();
+    var p=$('dePill');
+    if(!j.enabled){ p.className='pill watch'; p.textContent='Monitor is switched off (Admin > Advanced Settings > Deauth attack monitor)'; }
+    else if(j.level==='attack'){ p.className='pill attack'; p.textContent='\u26A0 DEAUTH ATTACK SUSPECTED - '+j.count10+' frames in 10 s'+(j.targets_us?' (aimed at this repeater / its upstream!)':''); }
+    else if(j.level==='watch'){ p.className='pill watch'; p.textContent='Suspicious: '+j.count10+' deauth frames in 10 s'; }
+    else { p.className='pill ok'; p.textContent='No deauth attack detected'; }
+    var s=$('deStats'); s.textContent='';
+    [['Channel',j.channel],['Last 10 s',j.count10],['Broadcast (10 s)',j.bcast10],['Aimed at us (10 s)',j.ours10],['Total seen',j.total],['Alert at',j.thr+' / 10 s']].forEach(function(x){
+      var b=el('div',{'class':'box'}); b.appendChild(el('span',null,x[0])); b.appendChild(el('div',{'class':'big','style':'font-size:1.2em'},String(x[1]))); s.appendChild(b); });
+    var e=$('deEvents'); e.textContent='';
+    if(j.events.length){
+      var t=el('table'); var h=el('tr'); ['Ago','Type','From','To','dBm'].forEach(function(x){h.appendChild(el('th',null,x));}); t.appendChild(h);
+      j.events.forEach(function(v){ var tr=el('tr'); tr.appendChild(el('td',null,v.age+'s')); tr.appendChild(el('td',null,(v.type)+(v.ours?' *':''))); tr.appendChild(el('td',null,v.src)); tr.appendChild(el('td',null,v.dst.toUpperCase()==='FF:FF:FF:FF:FF:FF'?'ALL':v.dst)); tr.appendChild(el('td',null,String(v.rssi))); t.appendChild(tr); });
+      e.appendChild(t); e.appendChild(el('small',{'class':'h'},'* aimed at this repeater or its upstream router'));
+    }
+  }catch(x){}
+}
+
+/* ---------- Speed test ---------- */
+function stat(a){ var m=a.reduce(function(x,y){return x+y;},0)/a.length; var j=0; for(var i=1;i<a.length;i++) j+=Math.abs(a[i]-a[i-1]); return {avg:m,jit:a.length>1?j/(a.length-1):0}; }
+async function runSpeed(){
+  var b=$('spBtn'); b.disabled=true; ['r_ping','r_jit','r_dn','r_up','i_ping','i_jit','i_dn','i_up'].forEach(function(i){$(i).textContent='-';});
+  var msg=$('spMsg'); msg.textContent='Testing WiFi link to repeater...';
+  try{
+    var t=[]; for(var i=0;i<10;i++){ var s=performance.now(); await fetch('/api/ping?'+Math.random(),{cache:'no-store'}); t.push(performance.now()-s); }
+    var st=stat(t); $('r_ping').textContent=st.avg.toFixed(0)+' ms'; $('r_jit').textContent=st.jit.toFixed(0)+' ms';
+    var s0=performance.now(); var rd=await fetch('/api/speed?kb=768&_='+Math.random(),{cache:'no-store'}); var buf=await rd.arrayBuffer(); var sec=(performance.now()-s0)/1000;
+    $('r_dn').textContent=(buf.byteLength*8/sec/1e6).toFixed(1);
+    var body=new Blob([new Uint8Array(512*1024)]); s0=performance.now(); await fetch('/api/upspeed',{method:'POST',body:body}); sec=(performance.now()-s0)/1000;
+    $('r_up').textContent=(512*1024*8/sec/1e6).toFixed(1);
+  }catch(e){ msg.textContent='Link test failed: '+e; }
+  msg.textContent='Testing internet (Cloudflare)...';
+  try{
+    var t2=[]; for(var k=0;k<6;k++){ var q=performance.now(); await fetch('https://speed.cloudflare.com/__down?bytes=0&r='+Math.random(),{cache:'no-store'}); t2.push(performance.now()-q); }
+    var st2=stat(t2.slice(1)); $('i_ping').textContent=st2.avg.toFixed(0)+' ms'; $('i_jit').textContent=st2.jit.toFixed(0)+' ms';
+    var ac=new AbortController(); var tm=setTimeout(function(){ac.abort();},8000); var got=0, t0=performance.now();
+    try{ var resp=await fetch('https://speed.cloudflare.com/__down?bytes=30000000&r='+Math.random(),{cache:'no-store',signal:ac.signal}); var rd2=resp.body.getReader();
+      while(true){ var x=await rd2.read(); if(x.done) break; got+=x.value.length; $('i_dn').textContent=(got*8/((performance.now()-t0)/1000)/1e6).toFixed(1); }
+    }catch(e){} clearTimeout(tm);
+    $('i_dn').textContent=(got*8/((performance.now()-t0)/1000)/1e6).toFixed(1);
+    var chunk=new Blob([new Uint8Array(1024*1024)],{type:'text/plain'}); var sent=0; t0=performance.now();
+    for(var u=0;u<4;u++){ await fetch('https://speed.cloudflare.com/__up',{method:'POST',body:chunk,headers:{'Content-Type':'text/plain'}}); sent+=1024*1024; $('i_up').textContent=(sent*8/((performance.now()-t0)/1000)/1e6).toFixed(1); }
+    msg.textContent='Done.';
+  }catch(e){ msg.textContent='Internet test failed. This device may have no internet access (not whitelisted?), or the browser blocked the request.'; }
+  b.disabled=false;
+}
+
+/* ---------- Diagnose ---------- */
+function step(box,ok,txt,fix){ var d=el('div',{'class':'step'}); d.appendChild(el('b',null,ok===true?'\u2705':(ok==='warn'?'\u26A0\uFE0F':'\u274C'))); d.appendChild(document.createTextNode(txt)); if(fix){ d.appendChild(el('small',{'class':'h'},'Fix: '+fix)); } box.appendChild(d); }
+async function runDiag(){
+  var b=$('dgBtn'); b.disabled=true; var out=$('dgOut'); out.textContent='Running (up to ~15 s)...';
+  try{
+    await fetch('/api/diag/start',{method:'POST'});
+    for(var i=0;i<25;i++){
+      await sleep(1000); var r=await fetch('/api/diag',{cache:'no-store'}); var j=await r.json();
+      if(j.state==='done'){ showDiag(j); b.disabled=false; return; }
+    }
+    out.textContent='Timed out.';
+  }catch(e){ out.textContent='Could not run: '+e; }
+  b.disabled=false;
+}
+function showDiag(j){
+  var o=$('dgOut'); o.textContent='';
+  if(!j.connected){ step(o,false,'Repeater is NOT connected to an upstream WiFi.','Admin > Upstream WiFi: enter the router name/password (2.4 GHz only), or pick it from the Analyzer tab.'); return; }
+  step(o,true,'Upstream: '+j.ssid+' (ch '+j.channel+', '+j.rssi+' dBm), IP '+j.ip);
+  if(j.rssi<-80) step(o,'warn','Upstream signal is weak ('+j.rssi+' dBm).','Move the repeater closer to the main router.');
+  if(j.gw==='ok'||j.gw==='refused') step(o,true,'Gateway '+j.gw_ip+' reachable ('+j.gw_ms+' ms)');
+  else step(o,'warn','Gateway '+j.gw_ip+' did not answer on port 80 (many routers hide it - not always a problem).');
+  var inet=j.inet.filter(function(x){return x.ok;});
+  if(inet.length) step(o,true,'Internet reachable: '+inet.map(function(x){return x.host+' '+x.ms+' ms';}).join(', '));
+  else step(o,false,'No internet reachable from the repeater (TCP to 1.1.1.1 / 8.8.8.8 failed).','Check that the main router itself has working internet, or that it does not block this device (MAC filter / parental control).');
+  if(j.dns_ok) step(o,true,'DNS works: google.com \u2192 '+j.dns_ip+' ('+j.dns_ms+' ms)');
+  else step(o,false,'DNS lookup failed.',inet.length?'Internet works but names do not resolve: set another DNS in Admin > Advanced Settings (8.8.8.8 / 1.1.1.1 / your ISP DNS).':'Fix the internet first, then recheck DNS.');
+  step(o,true,'Clients receive DNS '+j.client_dns+' from this repeater.',null);
+}
+</script>
+</body>
+</html>

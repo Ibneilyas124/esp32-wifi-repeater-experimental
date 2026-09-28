@@ -98,3 +98,16 @@ bash flash.sh /dev/ttyUSB0
   custom STA MAC, TX power, admin password
 - Hardware reset: hold the BOOT button ~8 s; when the blue LED blinks fast, release
 - Flash `full-flash-padded-0x0.bin` at offset `0x0` (compression OFF, baud 115200) from the Releases page
+
+
+## v3 notes (guest access, WiFi tools, About Developer)
+- Guests can now associate with the repeater's password but get **no internet** unless their
+  MAC is in the whitelist (Advanced Settings > "Guests: connect but no internet", default ON).
+  They can still reach the admin login page and /tools. Set it to 0 to go back to instant-kick.
+- New **/tools** page (no login): WiFi Analyzer (scans nearby networks, shows hidden BSSIDs,
+  vendor from OUI, channel congestion chart), Deauth attack monitor (passive), Speed test
+  (repeater link + real internet), Internet diagnosis (step-by-step).
+- Admin dashboard: connected-clients table now shows signal, whether each device currently has
+  internet, and a Kick button; header shows firmware version.
+- Login page footer replaced with "About Developer" (popup) and a link to /tools.
+- New advanced settings: guest_filter, deauth_monitor, deauth_alert (all with safe defaults).
