@@ -27,3 +27,6 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 
 # Bigger stack for the system event task (Wi-Fi/IP event handlers run there)
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# Smaller firmware = faster/safer flashing over Android USB (default is -Og debug)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
