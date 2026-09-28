@@ -223,6 +223,28 @@ static esp_err_t require_session_api(httpd_req_t *req) {
 
 /* ---------------- WiFi ---------------- */
 
+/* Without this, the AP advertises itself (192.168.4.1) as the DNS server to
+ * clients. ESP32 doesn't run a DNS resolver, so clients show "connected, no
+ * internet" even though NAT works. Fix: hand out the upstream router's DNS. */
+static void dns_setup_task(void *arg) {
+    esp_netif_dns_info_t dns;
+    esp_err_t e = esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns);
+    if (e == ESP_OK) {
+        esp_netif_dhcps_stop(s_ap_netif);
+        e = esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+        ESP_LOGI(TAG, "set_dns_info: %s", esp_err_to_name(e));
+        /* 0x02 = OFFER_DNS bit (raw value; the real header is private to lwip) */
+        uint8_t dhcps_dns_value = 0x02;
+        e = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                                    &dhcps_dns_value, sizeof(dhcps_dns_value));
+        ESP_LOGI(TAG, "dhcps_option(DNS): %s", esp_err_to_name(e));
+        esp_netif_dhcps_start(s_ap_netif);
+    } else {
+        ESP_LOGW(TAG, "No upstream DNS info yet: %s", esp_err_to_name(e));
+    }
+    vTaskDelete(NULL);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT) {
         switch (id) {
@@ -259,24 +281,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ESP_LOGI(TAG, "Got upstream IP: %s -- enabling NAT/NAPT", s_sta_ip);
         esp_netif_napt_enable(s_ap_netif);
 
-        /* Without this, the AP advertises itself (192.168.4.1) as the DNS
-         * server to connected clients. ESP32 doesn't run a DNS resolver, so
-         * clients show "connected, no internet" even though NAT works fine.
-         * Fix: forward the upstream router's real DNS server to AP clients. */
-        esp_netif_dns_info_t dns;
-        if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
-            esp_netif_dhcps_stop(s_ap_netif);
-            esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-            /* 0x02 = OFFER_DNS bit from ESP-IDF's internal dhcps_offer_option
-             * enum. We use the raw value here instead of including the
-             * private "dhcpserver/dhcpserver_options.h" header, which isn't
-             * visible outside ESP-IDF's own lwip component. */
-            uint8_t dhcps_dns_value = 0x02;
-            esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
-                                    &dhcps_dns_value, sizeof(dhcps_dns_value));
-            esp_netif_dhcps_start(s_ap_netif);
-            ESP_LOGI(TAG, "AP clients will now use upstream DNS for browsing");
-        }
+        /* DNS reconfiguration touches the DHCP server, so do it in its own
+         * task with a proper stack instead of the small event-loop stack. */
+        xTaskCreate(dns_setup_task, "dns_setup", 4096, NULL, 5, NULL);
     }
 }
 
@@ -719,6 +726,7 @@ static esp_err_t reboot_post_handler(httpd_req_t *req) {
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 14;
+    config.stack_size = 8192; /* status handler builds JSON + 512B buffers */
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t uris[] = {
