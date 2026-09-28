@@ -33,7 +33,6 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "cJSON.h"
-#include "dhcpserver/dhcpserver_options.h"
 #include "lwip/ip4_addr.h"
 
 static const char *TAG = "esp32-repeater";
@@ -268,7 +267,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
             esp_netif_dhcps_stop(s_ap_netif);
             esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
-            dhcps_offer_t dhcps_dns_value = OFFER_DNS;
+            /* 0x02 = OFFER_DNS bit from ESP-IDF's internal dhcps_offer_option
+             * enum. We use the raw value here instead of including the
+             * private "dhcpserver/dhcpserver_options.h" header, which isn't
+             * visible outside ESP-IDF's own lwip component. */
+            uint8_t dhcps_dns_value = 0x02;
             esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
                                     &dhcps_dns_value, sizeof(dhcps_dns_value));
             esp_netif_dhcps_start(s_ap_netif);
