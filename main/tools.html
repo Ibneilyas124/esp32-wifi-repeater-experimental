@@ -156,6 +156,31 @@ add('Realtek (chipset)','00E04C');
 add('MediaTek/Ralink (chipset)','000C43');
 add('Broadcom (chipset)','001018');
 add('Qualcomm/Atheros (chipset)','00037F 001374');
+add('Nokia','A87C6E 5C5015 DCF756');
+add('Fiberhome','9052DE 60D809 2CB05D 0022A1');
+add('ZyXEL','001349 001DB0 00A0C5 1CDF0F 2C0BE9 ECC8E0 F4E29B');
+add('Sagemcom','002481 4CA56D 88D274 CC8544 F8032E');
+add('Technicolor','0026DC 3831AF 649EF3 8CE081 F4B8B5');
+add('Arris/CommScope','000CE5 000F23 0018E7 001AC7 08CC68 74A78E B0A18B');
+add('Motorola/Arris','0007ED 00248C 001676 5C353B B4C8B9');
+add('Belkin','000C41 08863B 149182 24F5A2 302303 501AC5 58D56E 68 94103E B4750E C05627 C4411E EC1A59 F4F52A');
+add('Comfast','04A159 CC206E');
+add('Totolink','000EA6 3491C7');
+add('Mercusys','5C6265 A0FA76 F0A731');
+add('GL.iNet','9CADEF');
+add('Cudy','C0A72A');
+add('Vodafone/Huawei (branded router)','88259D');
+add('HFCL','C0EEFB');
+add('C-DATA','A87A73');
+add('VSOL/V-SOL','8CA6DF');
+add('Hikvision','4C1116 8CE748 BC0722');
+add('Dahua','3C6105 90020A E01705');
+add('Apple (phone/laptop hotspot)','000A27 001EC2 0026BB 041E64 08F4AB 0CD746 149EFA 18AF61 1C1AC0 20A2E4 244B03 28E14C 2C1F23 30636B 3451C9 40331A 4C57CA 5855CA 605AB0 68967B 6C40A9 70DEE2 78D75F 7C6D62 88664D 90B21F 985FD3 A4C361 A8FAD8 B8098C BCA920 C8B5B7 D89695 DC2B2A E0ACCB E4CE8F F0DBE2 F4F951');
+add('Samsung (phone/laptop hotspot)','001377 0016DB 002454 0821EF 149DDA 1C5A3E 24118A 34145F 40163B 4837E6 5001D9 5CF8A1 68279C 7CF854 8425DB 9C3AAF A00998 A81E84 B0DF3A C0BDD1 D0176A E8508B F0E4A2');
+add('Xiaomi/Redmi (phone hotspot)','2C4D54 3822AA 5C4CA9 64B473 8CBEBE ACC1EE F0B429');
+add('OnePlus/Oppo/Vivo (phone hotspot)','2C59E5 40D855 8863DF 9C28EF C0EEFB');
+add('Google (Pixel/Nest)','3C5AB4 5460C7 6C4008 A4772F F4F5D8 F8A626');
+
 function vendorOf(mac){
   var h=mac.replace(/[^0-9A-Fa-f]/g,'').toUpperCase(); if(h.length<6) return 'Unknown';
   var b0=parseInt(h.substr(0,2),16), key=h.substr(0,6);
@@ -187,6 +212,7 @@ async function startScan(){
 function secClass(a){ if(a==='Open') return 'bad'; if(a==='WEP') return 'bad'; if(a==='WPA') return 'warn'; return 'ok'; }
 function showScan(){
   $('scanOut').hidden=false;
+  autoLookup();
   var nets=scanData.nets; var sc=[]; for(var c=0;c<=14;c++) sc.push(0);
   nets.forEach(function(n){ var w=Math.max(1,n.rssi+100); for(var c=1;c<=13;c++){ var ov=Math.max(0,1-Math.abs(c-n.ch)/4); sc[c]+=ov*w; } });
   var mx=1,best=1; for(var c=1;c<=13;c++){ if(sc[c]>mx) mx=sc[c]; if(sc[c]<sc[best]) best=c; }
@@ -240,15 +266,25 @@ async function useUpstream(n){
   var r=await fetch('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:ssid,password:pw})});
   var j=await r.json(); alert(j.ok===false?('Error: '+j.error):'Saved. The repeater is rebooting - reconnect to its WiFi in ~20 s.');
 }
+async function autoLookup(){
+  if(!scanData) return; var todo=scanData.nets.filter(function(n){return isUnknown(vendorOf(n.bssid));}).slice(0,8);
+  if(!todo.length) return;
+  $('onlineMsg').textContent='Looking up unknown vendors online...';
+  await doLookup(todo);
+}
 async function lookupOnline(){
   if(!scanData) return; var todo=scanData.nets.filter(function(n){return isUnknown(vendorOf(n.bssid));}).slice(0,10);
-  if(!todo.length){ $('onlineMsg').textContent='Nothing unknown to look up.'; return; }
+  if(!todo.length){ $('onlineMsg').textContent='Nothing unknown left to look up.'; return; }
+  await doLookup(todo);
+}
+async function doLookup(todo){
   var done=0;
   for(var i=0;i<todo.length;i++){
-    try{ var r=await fetch('https://api.macvendors.com/'+encodeURIComponent(todo[i].bssid)); if(r.ok){ todo[i].vendor=(await r.text()).trim(); done++; } }catch(e){ $('onlineMsg').textContent='Online lookup unavailable (no internet or blocked by the browser).'; renderNets(); return; }
-    $('onlineMsg').textContent='Looked up '+(i+1)+'/'+todo.length+'...'; await sleep(1200);
+    try{ var r=await fetch('https://api.macvendors.com/'+encodeURIComponent(todo[i].bssid)); if(r.ok){ todo[i].vendor=(await r.text()).trim(); done++; } }catch(e){ $('onlineMsg').textContent='Online lookup unavailable right now (needs internet on this device).'; renderNets(); return; }
+    $('onlineMsg').textContent='Looked up '+(i+1)+'/'+todo.length+'...'; renderNets(); await sleep(1200);
   }
-  $('onlineMsg').textContent='Done ('+done+' found).'; renderNets();
+  $('onlineMsg').textContent=done?('Done - found '+done+'.'):'No matches found for the remaining networks.';
+  renderNets();
 }
 
 /* ---------- Deauth monitor ---------- */

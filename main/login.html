@@ -51,7 +51,10 @@ footer a{color:#7fd9bd;text-decoration:none}
     <label>Username</label>
     <input id="u" value="Sarfraz" readonly>
     <label>Password</label>
-    <input id="p" type="password" placeholder="Enter admin password" autofocus>
+    <div style="position:relative">
+      <input id="p" type="password" placeholder="Enter admin password" autofocus style="padding-right:44px">
+      <button type="button" onclick="togglePw()" style="position:absolute;right:4px;top:4px;bottom:4px;width:38px;margin:0;padding:0;background:#23282a;color:#9fd8c8;border:1px solid #33474a;border-radius:6px;font-size:13px;cursor:pointer">SHOW</button>
+    </div>
     <button onclick="doLogin()">Login</button>
     <div id="err"></div>
   </section>
@@ -91,6 +94,7 @@ async function doLogin(){
   }catch(x){ e.textContent='Could not reach the repeater'; }
 }
 document.getElementById('p').addEventListener('keydown',function(ev){ if(ev.key==='Enter') doLogin(); });
+function togglePw(){ var i=document.getElementById('p'); var b=event.target; if(i.type==='password'){i.type='text';b.textContent='HIDE';} else {i.type='password';b.textContent='SHOW';} }
 </script>
 </body>
 </html>

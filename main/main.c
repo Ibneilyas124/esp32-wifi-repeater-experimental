@@ -65,6 +65,13 @@ typedef struct { int64_t t; uint8_t type; uint8_t src[6]; uint8_t dst[6]; int8_t
 static deauth_evt_t s_deauth_ring[DEAUTH_RING];
 static volatile int s_deauth_head = 0, s_deauth_count = 0, s_deauth_total = 0;
 
+/* ---- upstream connection stability log ---- */
+#define DISCON_RING 10
+typedef struct { int64_t t; uint8_t reason; } discon_evt_t;
+static discon_evt_t s_discon_ring[DISCON_RING];
+static volatile int s_discon_head = 0, s_discon_count = 0, s_discon_total = 0;
+static int64_t s_sta_since_us = 0;   /* time of last successful upstream connect */
+
 /* ---- background scan / diagnose state ---- */
 static volatile int s_scan_state = 0;    /* 0 idle/done, 1 running, 2 error */
 static volatile int s_diag_state = 0;    /* 0 idle, 1 running, 2 done */
@@ -481,13 +488,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         case WIFI_EVENT_STA_START:
             esp_wifi_connect();
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *dc = (wifi_event_sta_disconnected_t *)data;
             s_sta_connected = false;
             strcpy(s_sta_ip, "0.0.0.0");
-            ESP_LOGW(TAG, "Upstream WiFi disconnected, retrying...");
+            int idx = s_discon_head;
+            s_discon_ring[idx].t = esp_timer_get_time();
+            s_discon_ring[idx].reason = dc ? dc->reason : 0;
+            s_discon_head = (s_discon_head + 1) % DISCON_RING;
+            if (s_discon_count < DISCON_RING) s_discon_count++;
+            s_discon_total++;
+            ESP_LOGW(TAG, "Upstream WiFi disconnected (reason %d), retrying...", dc ? dc->reason : 0);
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
             break;
+        }
         case WIFI_EVENT_AP_STACONNECTED: {
             wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
             char mac[18];
@@ -512,6 +527,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&ev->ip_info.ip));
         s_sta_connected = true;
+        s_sta_since_us = esp_timer_get_time();
         ESP_LOGI(TAG, "Upstream IP %s - enabling NAT", s_sta_ip);
         esp_netif_napt_enable(s_ap_netif);
     }
@@ -834,6 +850,20 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
         }
     }
     cJSON_AddItemToObject(root, "whitelist", wl);
+
+    cJSON_AddNumberToObject(root, "session_uptime_s", s_sta_connected ? (double)((esp_timer_get_time() - s_sta_since_us) / 1000000) : 0);
+    cJSON_AddNumberToObject(root, "discon_total", s_discon_total);
+    cJSON *dlog = cJSON_CreateArray();
+    int dn = s_discon_count;
+    int64_t now2 = esp_timer_get_time();
+    for (int i = 0; i < dn; i++) {
+        int idx = ((s_discon_head - 1 - i) % DISCON_RING + DISCON_RING) % DISCON_RING;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "ago_s", (double)((now2 - s_discon_ring[idx].t) / 1000000));
+        cJSON_AddNumberToObject(o, "reason", s_discon_ring[idx].reason);
+        cJSON_AddItemToArray(dlog, o);
+    }
+    cJSON_AddItemToObject(root, "discon_log", dlog);
     return send_json(req, root);
 }
 

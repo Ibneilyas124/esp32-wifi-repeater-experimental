@@ -38,12 +38,14 @@ label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
   <small>Ibn e Ilyas Technologies &middot; WiFi Repeater Admin &middot; <a href="/tools" style="color:#7fd9bd">&#128295; WiFi Tools</a> <span id="fw"></span></small>
 </header>
 
+<div class="card"><h2>Share this WiFi</h2><small class="h">Sends the repeater's own SSID + password (not your admin password) so a guest can join.</small><button class="ghost" style="margin-top:6px" onclick="shareWifi()">Copy / Share WiFi details</button><small class="h" id="shareMsg"></small></div>
 <div class="card"><h2>Status</h2><div id="status">Loading...</div></div>
+<details class="card" id="stab"><summary>Upstream stability log</summary><div id="stabBody">Loading...</div></details>
 
 <div class="card">
   <h2>Upstream WiFi (network to repeat)</h2>
   <input id="sta_ssid" placeholder="Upstream WiFi name (2.4 GHz)" autocomplete="off">
-  <input id="sta_pass" type="password" placeholder="Password (blank = keep current; open network if you changed the name)" autocomplete="off">
+  <div style="position:relative"><input id="sta_pass" type="password" placeholder="Password (blank = keep current; open network if you changed the name)" autocomplete="off" style="padding-right:44px"><button type="button" class="small ghost" onclick="pwToggle('sta_pass',this)" style="position:absolute;right:4px;top:50%;transform:translateY(-50%)">SHOW</button></div>
   <button onclick="saveWifi()">Save &amp; Reboot</button>
 </div>
 
@@ -83,7 +85,26 @@ label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
 </div>
 
 <script>
+function pwToggle(id,btn){ var i=document.getElementById(id); if(i.type==='password'){i.type='text';btn.textContent='HIDE';} else {i.type='password';btn.textContent='SHOW';} }
 function el(t,a,x){var e=document.createElement(t);if(a)for(var k in a)e.setAttribute(k,a[k]);if(x!==undefined)e.textContent=x;return e;}
+
+var REASONS={1:'Unspecified',2:'Auth expired',3:'Router disconnected us',4:'Inactivity timeout',5:'Too many devices on router',6:'Bad frame (class 2)',7:'Bad frame (class 3)',8:'Router said we left',15:'Wrong WiFi password (handshake failed)',200:'Signal lost (beacon timeout)',201:'Router not found / powered off',202:'Wrong WiFi password',203:'Association rejected',204:'Handshake timeout'};
+function reasonText(r){ return REASONS[r] || ('code '+r); }
+function renderStability(log){
+  var b=document.getElementById('stabBody'); b.textContent='';
+  if(!log.length){ b.appendChild(el('small',{'class':'h'},'No disconnects recorded this session.')); return; }
+  var t=el('table'); var h=el('tr'); ['Ago','Reason'].forEach(function(x){h.appendChild(el('th',null,x));}); t.appendChild(h);
+  log.forEach(function(e){ var tr=el('tr'); tr.appendChild(el('td',null,fmt(e.ago_s)+' ago')); tr.appendChild(el('td',null,reasonText(e.reason))); t.appendChild(tr); });
+  b.appendChild(t);
+}
+
+var lastApSsid='', lastApPass='';
+async function shareWifi(){
+  var text='WiFi: '+lastApSsid+'\nPassword: '+lastApPass;
+  if(navigator.share){ try{ await navigator.share({title:'WiFi details',text:text}); return; }catch(e){} }
+  try{ await navigator.clipboard.writeText(text); document.getElementById('shareMsg').textContent='Copied to clipboard.'; }
+  catch(e){ document.getElementById('shareMsg').textContent=text; }
+}
 function authFail(r){ if(r.status===401){ location.href='/'; return true; } return false; }
 function fmt(s){ var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return (d?d+'d ':'')+h+'h '+m+'m'; }
 var loaded=false, origSsid='';
@@ -93,7 +114,8 @@ async function refresh(){
   var s=document.getElementById('status'); s.textContent='';
   function line(a,b){ var d=el('div',{'class':'kv'}); d.appendChild(el('span',{'class':'k'},a)); d.appendChild(el('span',null,b)); s.appendChild(d); }
   line('Upstream', j.sta_connected ? 'Connected ('+j.sta_ip+')' : 'Not connected');
-  if(j.sta_connected) line('Remote admin', 'http://'+j.sta_ip);
+  if(j.sta_connected){ line('Remote admin', 'http://'+j.sta_ip); line('Session uptime', fmt(j.session_uptime_s)); }
+  if(j.discon_total) line('Upstream drops (total)', j.discon_total);
   line('Repeater IP', 'http://'+j.ap_ip);
   line('Guest mode', j.wl_active ? 'Active - non-whitelisted devices can join but get no internet' : 'Off (whitelist empty or disabled)');
   line('Uptime', fmt(j.uptime_s));
@@ -110,6 +132,7 @@ async function refresh(){
   var wrap=el('div',{'style':'overflow-x:auto'}); wrap.appendChild(t);
   s.appendChild(el('div',{'class':'k','style':'margin-top:8px'},'Connected devices ('+j.clients.length+')')); s.appendChild(wrap);
   document.getElementById('fw').textContent='v'+j.fw;
+  renderStability(j.discon_log||[]);
   if(!loaded){ origSsid=j.sta_ssid||''; document.getElementById('sta_ssid').value=origSsid; loaded=true; }
   var wl=document.getElementById('wl'); wl.textContent='';
   if(!j.whitelist.length){ wl.appendChild(el('small',{'class':'h'},'No restrictions')); }
@@ -143,12 +166,21 @@ async function rmMac(m){ var j=await post('/api/whitelist',{action:'remove',mac:
 async function loadSettings(){
   var r=await fetch('/api/settings'); if(authFail(r))return; var j=await r.json();
   var box=document.getElementById('sform'); box.textContent='';
-  j.items.forEach(function(it){
+  j.items.forEach(function(it){ if(it.key==='ap_ssid') lastApSsid=it.value; if(it.key==='ap_pass') lastApPass=it.value;
     var d=el('div',{'class':'fld'}); var inp;
+    var isPw=(it.type==='password'||it.type==='password_keep');
     if(it.type==='bool'){ inp=el('select'); [['0','No'],['1','Yes']].forEach(function(o){ var op=el('option',{value:o[0]},o[1]); inp.appendChild(op); }); inp.value=it.value; }
-    else { inp=el('input'); inp.type=(it.type==='password'||it.type==='password_keep')?'password':(it.type==='number'?'number':'text'); inp.value=it.value; if(it.type==='password_keep') inp.placeholder='(leave blank to keep current)'; }
+    else { inp=el('input'); inp.type=isPw?'password':(it.type==='number'?'number':'text'); inp.value=it.value; if(it.type==='password_keep') inp.placeholder='(leave blank to keep current)'; }
     inp.setAttribute('data-key',it.key); inp.setAttribute('data-def',it.def); inp.setAttribute('data-type',it.type); inp.setAttribute('autocomplete','off');
-    d.appendChild(el('label',null,it.label)); d.appendChild(inp); d.appendChild(el('small',null,it.hint+' | default: '+(it.def===''?'(blank)':it.def)));
+    d.appendChild(el('label',null,it.label));
+    if(isPw){
+      var wrap=el('div',{'style':'position:relative'}); inp.style.paddingRight='44px'; wrap.appendChild(inp);
+      var pid='fld_'+it.key; inp.id=pid;
+      var btn=el('button',{'type':'button','class':'small ghost','style':'position:absolute;right:4px;top:50%;transform:translateY(-50%)'},'SHOW');
+      btn.onclick=function(bid,b){ return function(){ pwToggle(bid,b); }; }(pid,btn);
+      wrap.appendChild(btn); d.appendChild(wrap);
+    } else { d.appendChild(inp); }
+    d.appendChild(el('small',null,it.hint+' | default: '+(it.def===''?'(blank)':it.def)));
     box.appendChild(d);
   });
 }
