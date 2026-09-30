@@ -11,6 +11,7 @@
  */
 
 #include <string.h>
+#include <inttypes.h>
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -496,7 +497,12 @@ static void usage_load(usage_entry_t *e) {
 static void usage_save(usage_entry_t *e) {
     char key[16]; usage_key(e->mac, key, sizeof(key));
     char v[96];
-    snprintf(v, sizeof(v), "%llu,%u,%d,%u,%d", (unsigned long long)e->total_bytes, e->week_bytes, e->week_no, e->month_bytes, e->month_no);
+    snprintf(v, sizeof(v), "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d",
+         (unsigned long long)e->total_bytes,
+         e->week_bytes,
+         e->week_no,
+         e->month_bytes,
+         e->month_no);
     nvs_set_string(key, v);
 }
 
