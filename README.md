@@ -111,3 +111,16 @@ bash flash.sh /dev/ttyUSB0
   internet, and a Kick button; header shows firmware version.
 - Login page footer replaced with "About Developer" (popup) and a link to /tools.
 - New advanced settings: guest_filter, deauth_monitor, deauth_alert (all with safe defaults).
+
+## v5 notes (this pass)
+- Fixed vendor-lookup "Unknown" root cause: online lookup needs internet on the
+  BROWSING device, which the v3 guest-filter blocks for non-whitelisted devices.
+  /tools now shows a clear banner explaining this and what to do about it.
+- Cleaned up duplicate/conflicting settings left over from an earlier interrupted
+  session (two competing static-IP systems, two usage-tracking systems). The
+  more complete, already-wired system was kept in every case.
+- Added the missing admin-dashboard UI for: internet speed-history chart.
+  (Data usage, bandwidth-limit-per-device, and restart-schedule backends and
+  their dashboard UI were already complete from the previous session.)
+- Added FEATURES.md (full A-to-Z feature list, update this file going forward).
+- See chat for the Ethernet-port hardware explanation (not a firmware-only change).

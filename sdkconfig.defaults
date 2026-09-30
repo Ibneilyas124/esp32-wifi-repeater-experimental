@@ -30,3 +30,11 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 # Smaller firmware = faster/safer flashing over Android USB (default is -Og debug)
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Bigger TCP window/buffers = meaningfully faster speed-test and general
+# throughput over WiFi (default window is quite small and caps real-world speed)
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=32

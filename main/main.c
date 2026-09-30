@@ -27,6 +27,8 @@
 #include "esp_private/wifi.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "esp_sntp.h"
+#include <time.h>
 #include "esp_timer.h"
 #include "esp_http_server.h"
 #include "nvs_flash.h"
@@ -72,6 +74,26 @@ static discon_evt_t s_discon_ring[DISCON_RING];
 static volatile int s_discon_head = 0, s_discon_count = 0, s_discon_total = 0;
 static int64_t s_sta_since_us = 0;   /* time of last successful upstream connect */
 
+/* ---- per-device usage tracking + optional uplink rate limit (whitelisted devices only) ---- */
+#define TRACK_MAX 16
+typedef struct {
+    uint8_t mac[6];
+    bool used;
+    uint64_t total_bytes;
+    uint32_t week_bytes;  int week_no;
+    uint32_t month_bytes; int month_no;
+    uint32_t bucket_tokens;
+    int64_t bucket_last_us;
+} usage_entry_t;
+static usage_entry_t s_usage[TRACK_MAX];
+static bool s_time_synced = false;
+
+/* ---- speed-history: periodic latency samples to 1.1.1.1 (every ~15 min) ---- */
+#define SPEEDHIST_MAX 48
+typedef struct { int64_t t; int ms; bool ok; } speedhist_t;
+static speedhist_t s_speedhist[SPEEDHIST_MAX];
+static int s_speedhist_head = 0, s_speedhist_count = 0;
+
 /* ---- background scan / diagnose state ---- */
 static volatile int s_scan_state = 0;    /* 0 idle/done, 1 running, 2 error */
 static volatile int s_diag_state = 0;    /* 0 idle, 1 running, 2 done */
@@ -101,6 +123,10 @@ static const setting_t SETTINGS[] = {
     {"guest_filter","Guests: connect but no internet",  "1",                        "bool",          "1 = wrong-listed devices can join & reach this page but get no internet. 0 = they get disconnected immediately"},
     {"deauth_monitor","Deauth attack monitor",          "1",                        "bool",          "Passively watches for deauth/disassoc floods nearby. See WiFi Tools > Deauth"},
     {"deauth_alert","Deauth alert threshold",           "10",                       "number",        "Frames in 10s that count as an attack (1-50)"},
+    {"sta_static_ip","Remote-management IP (static)",   "",                         "text",          "Blank = automatic (from main router). Set this to stop it changing, e.g. if you run 2+ repeaters"},
+    {"sta_gateway", "Static IP: main router's address", "",                         "text",          "Required only if Remote-management IP above is set. Usually the main router's own IP"},
+    {"sta_netmask", "Static IP: subnet mask",            "255.255.255.0",            "text",          "Required only if Remote-management IP above is set. Leave default unless you know why"},
+    {"auto_reboot_hours","Auto-restart every N hours",   "0",                        "number",        "0 = never. Otherwise the repeater reboots itself every N hours (1-168) to stay fresh"},
     {"admin_pass", "Admin password",                   "admin",                    "password_keep", "4-32 characters. Leave blank to keep the current one"},
 };
 #define N_SETTINGS (sizeof(SETTINGS) / sizeof(SETTINGS[0]))
@@ -162,6 +188,13 @@ static int get_setting_int(const char *key, int lo, int hi, int fallback) {
 
 /* ================= Validation ================= */
 
+static bool valid_ipv4_any(const char *s) {
+    unsigned a, b, c, d;
+    char extra;
+    if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4) return false;
+    return a <= 255 && b <= 255 && c <= 255 && d <= 255;
+}
+
 static bool valid_host_ipv4(const char *s) {
     unsigned a, b, c, d;
     char extra;
@@ -214,6 +247,12 @@ static bool validate_setting(const char *key, const char *v, char *err, size_t n
         }
     } else if (strcmp(key, "tx_power") == 0) {
         if (!int_in_range(v, 2, 20)) { snprintf(err, n, "must be 2-20"); return false; }
+    } else if (strcmp(key, "sta_static_ip") == 0 || strcmp(key, "sta_gateway") == 0) {
+        if (len != 0 && !valid_ipv4_any(v)) { snprintf(err, n, "must be a valid IPv4 address, or blank"); return false; }
+    } else if (strcmp(key, "sta_netmask") == 0) {
+        if (!valid_ipv4_any(v)) { snprintf(err, n, "must be a valid IPv4 mask like 255.255.255.0"); return false; }
+    } else if (strcmp(key, "auto_reboot_hours") == 0) {
+        if (!int_in_range(v, 0, 168)) { snprintf(err, n, "must be 0-168"); return false; }
     } else if (strcmp(key, "guest_filter") == 0 || strcmp(key, "deauth_monitor") == 0) {
         if (strcmp(v, "0") != 0 && strcmp(v, "1") != 0) { snprintf(err, n, "must be 0 or 1"); return false; }
     } else if (strcmp(key, "deauth_alert") == 0) {
@@ -238,20 +277,35 @@ static bool mac_str_eq(const char *a, const char *b) {
     return strcasecmp(a, b) == 0;
 }
 
-static void split_entry(const char *entry, char *mac_out, size_t mac_len, char *name_out, size_t name_len) {
-    const char *bar = strchr(entry, '|');
-    if (bar) {
-        size_t mlen = (size_t)(bar - entry);
-        if (mlen >= mac_len) mlen = mac_len - 1;
-        memcpy(mac_out, entry, mlen);
-        mac_out[mlen] = '\0';
-        strncpy(name_out, bar + 1, name_len - 1);
-        name_out[name_len - 1] = '\0';
-    } else {
-        strncpy(mac_out, entry, mac_len - 1);
-        mac_out[mac_len - 1] = '\0';
-        name_out[0] = '\0';
+static void split_entry3(const char *entry, char *mac_out, size_t mac_len, char *name_out, size_t name_len, int *limit_out) {
+    const char *bar1 = strchr(entry, '|');
+    if (!bar1) {
+        strncpy(mac_out, entry, mac_len - 1); mac_out[mac_len - 1] = '\0';
+        name_out[0] = '\0'; if (limit_out) *limit_out = 0;
+        return;
     }
+    size_t mlen = (size_t)(bar1 - entry);
+    if (mlen >= mac_len) mlen = mac_len - 1;
+    memcpy(mac_out, entry, mlen);
+    mac_out[mlen] = '\0';
+
+    const char *bar2 = strchr(bar1 + 1, '|');
+    if (bar2) {
+        size_t nlen = (size_t)(bar2 - (bar1 + 1));
+        if (nlen >= name_len) nlen = name_len - 1;
+        memcpy(name_out, bar1 + 1, nlen);
+        name_out[nlen] = '\0';
+        if (limit_out) *limit_out = atoi(bar2 + 1);
+    } else {
+        strncpy(name_out, bar1 + 1, name_len - 1);
+        name_out[name_len - 1] = '\0';
+        if (limit_out) *limit_out = 0;
+    }
+}
+
+/* kept for the 2 call sites that only ever need mac+name */
+static void split_entry(const char *entry, char *mac_out, size_t mac_len, char *name_out, size_t name_len) {
+    split_entry3(entry, mac_out, mac_len, name_out, name_len, NULL);
 }
 
 static bool whitelist_contains(const char *mac) {
@@ -297,6 +351,25 @@ static bool whitelist_get_name(const char *mac, char *name_out, size_t name_len)
     return found;
 }
 
+static int whitelist_get_limit(const char *mac) {
+    char list[WL_BUF];
+    whitelist_get(list, sizeof(list));
+    if (strlen(list) == 0) return 0;
+    char *copy = strdup(list);
+    if (!copy) return 0;
+    char *tok = strtok(copy, ",");
+    int limit = 0;
+    while (tok) {
+        while (*tok == ' ') tok++;
+        char m[20], n[64]; int lim = 0;
+        split_entry3(tok, m, sizeof(m), n, sizeof(n), &lim);
+        if (mac_str_eq(m, mac)) { limit = lim; break; }
+        tok = strtok(NULL, ",");
+    }
+    free(copy);
+    return limit;
+}
+
 static void whitelist_remove(const char *mac) {
     char list[WL_BUF];
     whitelist_get(list, sizeof(list));
@@ -307,8 +380,8 @@ static void whitelist_remove(const char *mac) {
     bool first = true;
     while (tok) {
         while (*tok == ' ') tok++;
-        char m[20], n[64];
-        split_entry(tok, m, sizeof(m), n, sizeof(n));
+        char m[20], n[64]; int lim2;
+        split_entry3(tok, m, sizeof(m), n, sizeof(n), &lim2);
         if (!mac_str_eq(m, mac)) {
             if (!first) strncat(out, ",", sizeof(out) - strlen(out) - 1);
             strncat(out, tok, sizeof(out) - strlen(out) - 1);
@@ -320,8 +393,8 @@ static void whitelist_remove(const char *mac) {
     whitelist_set(out);
 }
 
-/* Adds or renames an entry. Returns false when the list is full. */
-static bool whitelist_add(const char *mac, const char *name) {
+/* Adds or renames an entry (limit_kbps 0 = unlimited). Returns false when the list is full. */
+static bool whitelist_add(const char *mac, const char *name, int limit_kbps) {
     whitelist_remove(mac);
     char clean[48];
     size_t j = 0;
@@ -329,16 +402,18 @@ static bool whitelist_add(const char *mac, const char *name) {
         clean[j++] = (name[i] == ',' || name[i] == '|') ? ' ' : name[i];
     }
     clean[j] = '\0';
+    if (limit_kbps < 0) limit_kbps = 0;
+    if (limit_kbps > 100000) limit_kbps = 100000;
 
     char list[WL_BUF];
     whitelist_get(list, sizeof(list));
-    char entry[96];
-    snprintf(entry, sizeof(entry), "%.20s|%.47s", mac, clean);
+    char entry[112];
+    snprintf(entry, sizeof(entry), "%.20s|%.47s|%d", mac, clean, limit_kbps);
     if (strlen(list) + strlen(entry) + 2 >= WL_BUF) return false;
     if (strlen(list) == 0) {
         whitelist_set(entry);
     } else {
-        char buf[WL_BUF + 128];
+        char buf[WL_BUF + 144];
         snprintf(buf, sizeof(buf), "%s,%s", list, entry);
         whitelist_set(buf);
     }
@@ -402,6 +477,70 @@ static bool secure_equal(const char *a, const char *b) {
  * "guest_filter" is on AND the whitelist is not empty (an empty whitelist
  * still means "allow everyone fully", unchanged from earlier versions). */
 
+/* ---- usage tracking + rate limit helpers ---- */
+
+static void usage_key(const uint8_t mac[6], char *out, size_t n) {
+    snprintf(out, n, "u%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void usage_load(usage_entry_t *e) {
+    char key[16]; usage_key(e->mac, key, sizeof(key));
+    char v[96] = "";
+    nvs_get_string(key, v, sizeof(v), "");
+    unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
+    if (sscanf(v, "%llu,%u,%d,%u,%d", &tb, &wb, &wn, &mb, &mn) == 5) {
+        e->total_bytes = tb; e->week_bytes = wb; e->week_no = wn; e->month_bytes = mb; e->month_no = mn;
+    }
+}
+
+static void usage_save(usage_entry_t *e) {
+    char key[16]; usage_key(e->mac, key, sizeof(key));
+    char v[96];
+    snprintf(v, sizeof(v), "%llu,%u,%d,%u,%d", (unsigned long long)e->total_bytes, e->week_bytes, e->week_no, e->month_bytes, e->month_no);
+    nvs_set_string(key, v);
+}
+
+/* finds a tracked device, creating a new slot (loaded from NVS) the first time it is seen */
+static usage_entry_t *usage_find_or_add(const uint8_t mac[6]) {
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (s_usage[i].used && memcmp(s_usage[i].mac, mac, 6) == 0) return &s_usage[i];
+    }
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (!s_usage[i].used) {
+            memset(&s_usage[i], 0, sizeof(usage_entry_t));
+            memcpy(s_usage[i].mac, mac, 6);
+            s_usage[i].used = true;
+            usage_load(&s_usage[i]);
+            return &s_usage[i];
+        }
+    }
+    return NULL; /* table full - that device just won't be tracked */
+}
+
+/* call once/minute or so: rolls week/month counters over using real time (needs SNTP) */
+static void usage_housekeeping(void) {
+    time_t now = time(NULL);
+    if (now < 1700000000) return; /* clock not synced yet - do not reset anything on guesswork */
+    int week_no = (int)(now / 604800);
+    struct tm tmv; localtime_r(&now, &tmv);
+    int month_no = tmv.tm_year * 12 + tmv.tm_mon;
+    bool any_dirty = false;
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (!s_usage[i].used) continue;
+        bool dirty = false;
+        if (s_usage[i].week_no != week_no) { s_usage[i].week_bytes = 0; s_usage[i].week_no = week_no; dirty = true; }
+        if (s_usage[i].month_no != month_no) { s_usage[i].month_bytes = 0; s_usage[i].month_no = month_no; dirty = true; }
+        if (dirty) { usage_save(&s_usage[i]); any_dirty = true; }
+    }
+    (void)any_dirty;
+}
+
+static void usage_persist_all(void) {
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (s_usage[i].used) usage_save(&s_usage[i]);
+    }
+}
+
 static void update_subnet_cache(void) {
     char ip[16];
     get_setting("ap_ip", ip, sizeof(ip));
@@ -418,6 +557,31 @@ static esp_err_t ap_rx_filter(void *buffer, uint16_t len, void *eb) {
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X", f[6], f[7], f[8], f[9], f[10], f[11]);
     if (whitelist_contains(mac)) {
+        usage_entry_t *ue = usage_find_or_add(f + 6);
+        if (ue) {
+            ue->total_bytes += len;
+            ue->week_bytes += len;
+            ue->month_bytes += len;
+
+            int limit_kbps = whitelist_get_limit(mac);
+            if (limit_kbps > 0) {
+                int64_t now = esp_timer_get_time();
+                if (ue->bucket_last_us == 0) ue->bucket_last_us = now;
+                int64_t dt = now - ue->bucket_last_us;
+                if (dt > 0) {
+                    uint64_t refill = (uint64_t)dt * (uint32_t)limit_kbps * 1000ULL / 8ULL / 1000000ULL;
+                    uint32_t cap = (uint32_t)limit_kbps * 1000 / 8;  /* ~1 second burst */
+                    uint64_t nt = (uint64_t)ue->bucket_tokens + refill;
+                    ue->bucket_tokens = nt > cap ? cap : (uint32_t)nt;
+                    ue->bucket_last_us = now;
+                }
+                if (ue->bucket_tokens < len) {
+                    esp_wifi_internal_free_rx_buffer(eb);   /* over the uplink limit - drop this packet */
+                    return ESP_OK;
+                }
+                ue->bucket_tokens -= len;
+            }
+        }
         esp_netif_receive(s_ap_netif, buffer, len, eb);
         return ESP_OK;
     }
@@ -530,6 +694,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         s_sta_since_us = esp_timer_get_time();
         ESP_LOGI(TAG, "Upstream IP %s - enabling NAT", s_sta_ip);
         esp_netif_napt_enable(s_ap_netif);
+
+        if (!s_time_synced) {
+            s_time_synced = true; /* only ever try once per boot */
+            esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_init();
+            ESP_LOGI(TAG, "SNTP time sync started (needed for weekly/monthly usage totals)");
+        }
     }
 }
 
@@ -573,6 +745,22 @@ static void wifi_init(void) {
     char hostname[40];
     get_setting("hostname", hostname, sizeof(hostname));
     esp_netif_set_hostname(s_sta_netif, hostname);
+
+    char sip[16], sgw[16], smask[16];
+    get_setting("sta_static_ip", sip, sizeof(sip));
+    get_setting("sta_gateway", sgw, sizeof(sgw));
+    get_setting("sta_netmask", smask, sizeof(smask));
+    if (sip[0] != '\0' && sgw[0] != '\0') {
+        esp_netif_dhcpc_stop(s_sta_netif);
+        esp_netif_ip_info_t sinfo = { 0 };
+        sinfo.ip.addr = esp_ip4addr_aton(sip);
+        sinfo.gw.addr = esp_ip4addr_aton(sgw);
+        sinfo.netmask.addr = esp_ip4addr_aton(smask[0] ? smask : "255.255.255.0");
+        esp_err_t se = esp_netif_set_ip_info(s_sta_netif, &sinfo);
+        ESP_LOGI(TAG, "Static upstream IP %s via gw %s: %s", sip, sgw, esp_err_to_name(se));
+    } else {
+        ESP_LOGI(TAG, "Upstream IP: automatic (DHCP)");
+    }
 
     configure_ap_network();
 
@@ -638,6 +826,8 @@ static void wifi_init(void) {
  * We MUST wait for release before restarting: GPIO0 low at reset means
  * "enter download mode" and the firmware would not start. */
 
+static int tcp_probe(const char *ip, int port, int timeout_ms); /* defined later, used here for speed-history sampling */
+
 static void button_task(void *arg) {
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << RESET_BTN_GPIO,
@@ -658,7 +848,29 @@ static void button_task(void *arg) {
     gpio_set_level(LED_GPIO, 0);
 
     int held_ms = 0;
+    uint32_t tick = 0;
     while (1) {
+        tick++;
+        if (tick % 600 == 0) {          /* every ~60s */
+            usage_housekeeping();
+            int hrs = get_setting_int("auto_reboot_hours", 0, 168, 0);
+            if (hrs > 0 && (esp_timer_get_time() - s_boot_time_us) >= (int64_t)hrs * 3600LL * 1000000LL) {
+                ESP_LOGW(TAG, "Scheduled auto-restart (%d h) reached", hrs);
+                esp_restart();
+            }
+        }
+        if (tick % 3000 == 0) {         /* every ~5 min */
+            usage_persist_all();
+        }
+        if (tick % 9000 == 0 && s_sta_connected) {   /* every ~15 min */
+            int ms = tcp_probe("1.1.1.1", 443, 2000);
+            int idx = s_speedhist_head;
+            s_speedhist[idx].t = esp_timer_get_time();
+            s_speedhist[idx].ms = ms >= 0 ? ms : 0;
+            s_speedhist[idx].ok = ms >= 0;
+            s_speedhist_head = (s_speedhist_head + 1) % SPEEDHIST_MAX;
+            if (s_speedhist_count < SPEEDHIST_MAX) s_speedhist_count++;
+        }
         if (gpio_get_level(RESET_BTN_GPIO) == 0) {
             held_ms += 100;
             if (held_ms >= RESET_HOLD_MS) {
@@ -838,11 +1050,12 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
             char *tok = strtok(copy, ",");
             while (tok) {
                 while (*tok == ' ') tok++;
-                char m[20], n[64];
-                split_entry(tok, m, sizeof(m), n, sizeof(n));
+                char m[20], n[64]; int lim = 0;
+                split_entry3(tok, m, sizeof(m), n, sizeof(n), &lim);
                 cJSON *e = cJSON_CreateObject();
                 cJSON_AddStringToObject(e, "mac", m);
                 cJSON_AddStringToObject(e, "name", n);
+                cJSON_AddNumberToObject(e, "limit_kbps", lim);
                 cJSON_AddItemToArray(wl, e);
                 tok = strtok(NULL, ",");
             }
@@ -888,7 +1101,9 @@ static esp_err_t whitelist_post_handler(httpd_req_t *req) {
         char norm[18];
         snprintf(norm, sizeof(norm), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
         if (strcmp(action->valuestring, "add") == 0) {
-            if (!whitelist_add(norm, cJSON_IsString(name) ? name->valuestring : "")) {
+            cJSON *limit = cJSON_GetObjectItem(j, "limit_kbps");
+            int lim = cJSON_IsNumber(limit) ? limit->valueint : 0;
+            if (!whitelist_add(norm, cJSON_IsString(name) ? name->valuestring : "", lim)) {
                 ok = false;
                 err = "whitelist is full";
             }
@@ -1242,7 +1457,7 @@ static esp_err_t speed_get_handler(httpd_req_t *req) {
     int kb = atoi(kbs);
     if (kb <= 0 || kb > 4096) kb = 256;
 
-    static char chunk[4096];
+    static char chunk[16384];
     memset(chunk, 'A', sizeof(chunk));
     httpd_resp_set_type(req, "application/octet-stream");
     int remaining = kb * 1024;
@@ -1361,6 +1576,47 @@ static esp_err_t diag_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t usage_get_handler(httpd_req_t *req) {
+    if (require_session_api(req) != ESP_OK) return ESP_OK;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "time_synced", time(NULL) >= 1700000000);
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (!s_usage[i].used) continue;
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 s_usage[i].mac[0], s_usage[i].mac[1], s_usage[i].mac[2], s_usage[i].mac[3], s_usage[i].mac[4], s_usage[i].mac[5]);
+        char name[64] = "";
+        whitelist_get_name(mac, name, sizeof(name));
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "mac", mac);
+        cJSON_AddStringToObject(o, "name", name);
+        cJSON_AddNumberToObject(o, "total_bytes", (double)s_usage[i].total_bytes);
+        cJSON_AddNumberToObject(o, "week_bytes", s_usage[i].week_bytes);
+        cJSON_AddNumberToObject(o, "month_bytes", s_usage[i].month_bytes);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "devices", arr);
+    return send_json(req, root);
+}
+
+static esp_err_t speedhistory_get_handler(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_CreateArray();
+    int64_t now = esp_timer_get_time();
+    int n = s_speedhist_count;
+    for (int i = 0; i < n; i++) {
+        int idx = ((s_speedhist_head - 1 - i) % SPEEDHIST_MAX + SPEEDHIST_MAX) % SPEEDHIST_MAX;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "ago_s", (double)((now - s_speedhist[idx].t) / 1000000));
+        cJSON_AddNumberToObject(o, "ms", s_speedhist[idx].ms);
+        cJSON_AddBoolToObject(o, "ok", s_speedhist[idx].ok);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_AddItemToObject(root, "samples", arr);
+    return send_json(req, root);
+}
+
 static esp_err_t reboot_post_handler(httpd_req_t *req) {
     if (require_session_api(req) != ESP_OK) return ESP_OK;
     send_result(req, true, NULL);
@@ -1378,7 +1634,7 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 30;
     config.stack_size = 8192;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -1410,6 +1666,8 @@ static void start_webserver(void) {
         {.uri = "/api/upspeed",        .method = HTTP_POST, .handler = upspeed_post_handler},
         {.uri = "/api/diag/start",     .method = HTTP_POST, .handler = diag_start_post_handler},
         {.uri = "/api/diag",           .method = HTTP_GET,  .handler = diag_get_handler},
+        {.uri = "/api/usage",          .method = HTTP_GET,  .handler = usage_get_handler},
+        {.uri = "/api/speedhistory",   .method = HTTP_GET,  .handler = speedhistory_get_handler},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);

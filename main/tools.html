@@ -62,6 +62,7 @@ td,th{border-bottom:1px solid #262b2d;padding:5px 3px;text-align:left}
 
 <!-- ============ ANALYZER ============ -->
 <div id="p-an">
+  <div class="card" id="netBanner" hidden></div>
   <div class="card">
     <h2>WiFi Analyzer</h2>
     <small class="h">Scans nearby networks (including hidden ones: name blank, BSSID still shown). The repeater's WiFi pauses for a few seconds while scanning.</small>
@@ -112,6 +113,11 @@ td,th{border-bottom:1px solid #262b2d;padding:5px 3px;text-align:left}
     </div>
     <small class="h" id="spMsg"></small>
   </div>
+  <div class="card">
+    <h2>Internet responsiveness - last 12 hours</h2>
+    <small class="h">Auto-sampled every ~15 min (ping to 1.1.1.1). Taller = slower/worse; a gap in bars means it timed out.</small>
+    <div id="histChart" class="chart"></div>
+  </div>
 </div>
 
 <!-- ============ DIAGNOSE ============ -->
@@ -131,10 +137,46 @@ function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
 var isAdmin=false, deTimer=null;
 fetch('/api/me').then(function(r){return r.json();}).then(function(j){isAdmin=!!j.admin;}).catch(function(){});
 
+
+async function loadSpeedHistory(){
+  try{
+    var r=await fetch('/api/speedhistory',{cache:'no-store'}); var j=await r.json();
+    var c=$('histChart'); c.textContent='';
+    var samples=j.samples.slice().reverse();
+    if(!samples.length){ c.appendChild(el('small',{'class':'h'},'No samples yet (device needs ~15 min of uptime).')); return; }
+    var mx=Math.max(50,Math.max.apply(null,samples.map(function(s){return s.ok?s.ms:0;})));
+    samples.forEach(function(s){
+      var d=el('div',{'class':(s.ok?'':'cur')}); var i=el('i');
+      i.style.height=(s.ok?Math.max(2,Math.round(s.ms/mx*90)):3)+'px';
+      if(!s.ok) i.style.background='#e04a4a';
+      d.appendChild(i); c.appendChild(d);
+    });
+  }catch(e){}
+}
+
+var hasInternet = null;
+async function checkOwnInternet(){
+  try{
+    var ac=new AbortController(); var tm=setTimeout(function(){ac.abort();},3000);
+    await fetch('https://api.macvendors.com/00:00:00:00:00:00',{cache:'no-store',signal:ac.signal});
+    clearTimeout(tm); hasInternet=true;
+  }catch(e){ hasInternet=false; }
+  var b=$('netBanner');
+  if(hasInternet===false){
+    b.hidden=false; b.style.borderColor='#e04a4a';
+    b.innerHTML='<h2 style="color:#ff9c9c">This phone has no internet through the repeater</h2>'+
+      '<small class="h">Online vendor lookups need internet on THIS device. If a MAC whitelist is active on the repeater '+
+      'and this phone/device is not on it, it only gets local access - so router-company lookups will show "Unknown". '+
+      'Ask the repeater admin to whitelist this device\'s MAC, or ask them to turn off the whitelist temporarily.</small>';
+  } else { b.hidden=true; }
+}
+checkOwnInternet();
+
 function showTab(id){
   ['an','de','sp','dg'].forEach(function(t){ $('p-'+t).hidden=(t!==id); $('tb-'+t).className=(t===id?'on':''); });
   if(deTimer){clearInterval(deTimer);deTimer=null;}
   if(id==='de'){ loadDeauth(); deTimer=setInterval(loadDeauth,3000); }
+  if(id==='sp'){ loadSpeedHistory(); }
 }
 
 /* ---------- Vendor lookup (offline list of common router/AP makers) ---------- */
@@ -210,8 +252,9 @@ async function startScan(){
   b.disabled=false;
 }
 function secClass(a){ if(a==='Open') return 'bad'; if(a==='WEP') return 'bad'; if(a==='WPA') return 'warn'; return 'ok'; }
-function showScan(){
+async function showScan(){
   $('scanOut').hidden=false;
+  await checkOwnInternet();
   autoLookup();
   var nets=scanData.nets; var sc=[]; for(var c=0;c<=14;c++) sc.push(0);
   nets.forEach(function(n){ var w=Math.max(1,n.rssi+100); for(var c=1;c<=13;c++){ var ov=Math.max(0,1-Math.abs(c-n.ch)/4); sc[c]+=ov*w; } });

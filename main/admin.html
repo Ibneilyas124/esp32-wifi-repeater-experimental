@@ -55,8 +55,21 @@ label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
   <div id="wl"></div>
   <input id="newmac" placeholder="AA:BB:CC:DD:EE:FF" autocomplete="off">
   <input id="newname" placeholder="Device name (e.g. Ali's phone)" autocomplete="off">
+  <input id="newlimit" type="number" placeholder="Upload speed limit in Kbps (blank = unlimited)" autocomplete="off">
+  <small class="h">Limit only throttles this device's uploads, not downloads/streaming - a hardware limit of this design.</small>
   <button onclick="addMac()">Add to Whitelist</button>
 </div>
+
+<details class="card" id="usageCard"><summary>Data usage (whitelisted devices)</summary>
+  <small class="h" id="usageNote"></small>
+  <div id="usageBody">Open this to load.</div>
+</details>
+
+<details class="card" id="shCard"><summary>Internet speed history (last 12 hours)</summary>
+  <small class="h">Samples latency to 1.1.1.1 every ~15 minutes while online. Green bar = reachable, red = timed out.</small>
+  <div id="shChart" style="display:flex;align-items:flex-end;gap:2px;height:90px;margin-top:8px"></div>
+  <small class="h" id="shNote"></small>
+</details>
 
 <details class="card" id="adv">
   <summary>&#9881;&#65039; Advanced Settings (tap to open)</summary>
@@ -105,6 +118,33 @@ async function shareWifi(){
   try{ await navigator.clipboard.writeText(text); document.getElementById('shareMsg').textContent='Copied to clipboard.'; }
   catch(e){ document.getElementById('shareMsg').textContent=text; }
 }
+
+function fmtBytes(b){ if(b>1073741824) return (b/1073741824).toFixed(2)+' GB'; if(b>1048576) return (b/1048576).toFixed(1)+' MB'; if(b>1024) return (b/1024).toFixed(0)+' KB'; return b+' B'; }
+document.getElementById('usageCard').addEventListener('toggle',function(){ if(this.open) loadUsage(); });
+async function loadUsage(){
+  var r=await fetch('/api/usage'); if(authFail(r))return; var j=await r.json();
+  document.getElementById('usageNote').textContent = j.time_synced ? '' : 'Clock not synced yet (needs internet) - totals will start once time syncs.';
+  var b=document.getElementById('usageBody'); b.textContent='';
+  if(!j.devices.length){ b.appendChild(el('small',{'class':'h'},'No data yet - usage is only tracked for whitelisted devices.')); return; }
+  var t=el('table'); var h=el('tr'); ['Device','This week','This month','All-time'].forEach(function(x){h.appendChild(el('th',null,x));}); t.appendChild(h);
+  j.devices.forEach(function(d){ var tr=el('tr'); tr.appendChild(el('td',null,d.name||d.mac)); tr.appendChild(el('td',null,fmtBytes(d.week_bytes))); tr.appendChild(el('td',null,fmtBytes(d.month_bytes))); tr.appendChild(el('td',null,fmtBytes(d.total_bytes))); t.appendChild(tr); });
+  b.appendChild(t);
+}
+
+document.getElementById('shCard').addEventListener('toggle',function(){ if(this.open) loadSpeedHistory(); });
+async function loadSpeedHistory(){
+  var r=await fetch('/api/speedhistory'); if(authFail(r))return; var j=await r.json();
+  var box=document.getElementById('shChart'); box.textContent='';
+  if(!j.samples.length){ document.getElementById('shNote').textContent='No samples yet - first one appears ~15 min after the repeater goes online.'; return; }
+  var samples=j.samples.slice().reverse(); /* oldest first for left-to-right chart */
+  var mx=Math.max(50, Math.max.apply(null, samples.map(function(s){return s.ok?s.ms:0;})));
+  samples.forEach(function(s){
+    var bar=el('div',{'style':'flex:1;min-width:3px;background:'+(s.ok?'#00e0a0':'#e04a4a')+';border-radius:2px 2px 0 0;height:'+(s.ok?Math.max(4,Math.round(s.ms/mx*88)):88)+'px'});
+    box.appendChild(bar);
+  });
+  var okCount=samples.filter(function(s){return s.ok;}).length;
+  document.getElementById('shNote').textContent=okCount+'/'+samples.length+' checks reachable. Bar height = latency (taller = slower); red = internet was down at that check.';
+}
 function authFail(r){ if(r.status===401){ location.href='/'; return true; } return false; }
 function fmt(s){ var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return (d?d+'d ':'')+h+'h '+m+'m'; }
 var loaded=false, origSsid='';
@@ -137,7 +177,7 @@ async function refresh(){
   var wl=document.getElementById('wl'); wl.textContent='';
   if(!j.whitelist.length){ wl.appendChild(el('small',{'class':'h'},'No restrictions')); }
   j.whitelist.forEach(function(w){
-    var row=el('div',{'class':'row'}); var i=el('input',{'readonly':'readonly'}); i.value=(w.name?w.name+' - ':'')+w.mac;
+    var row=el('div',{'class':'row'}); var i=el('input',{'readonly':'readonly'}); i.value=(w.name?w.name+' - ':'')+w.mac+(w.limit_kbps?' ('+w.limit_kbps+' Kbps up)':'');
     var b=el('button',{'class':'small danger'},'X'); b.onclick=function(){ rmMac(w.mac); };
     row.appendChild(i); row.appendChild(b); wl.appendChild(row);
   });
@@ -156,9 +196,10 @@ async function saveWifi(){
 }
 async function addMac(){
   var m=document.getElementById('newmac').value.trim(); if(!m) return;
-  var j=await post('/api/whitelist',{action:'add',mac:m,name:document.getElementById('newname').value.trim()});
+  var lim=parseInt(document.getElementById('newlimit').value)||0;
+  var j=await post('/api/whitelist',{action:'add',mac:m,name:document.getElementById('newname').value.trim(),limit_kbps:lim});
   if(j&&j.ok===false){ alert(j.error); return; }
-  document.getElementById('newmac').value=''; document.getElementById('newname').value=''; refresh();
+  document.getElementById('newmac').value=''; document.getElementById('newname').value=''; document.getElementById('newlimit').value=''; refresh();
 }
 async function kick(m){ if(!confirm('Disconnect '+m+' now?')) return; var j=await post('/api/kick',{mac:m}); if(j&&j.ok===false) alert(j.error); setTimeout(refresh,1500); }
 async function rmMac(m){ var j=await post('/api/whitelist',{action:'remove',mac:m}); if(j) refresh(); }
