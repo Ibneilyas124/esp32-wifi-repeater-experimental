@@ -549,7 +549,7 @@ static void usage_load(usage_entry_t *e) {
     char key[16]; usage_key(e->mac, key, sizeof(key));
     char v[96] = "";
     nvs_get_string(key, v, sizeof(v), "");
-    unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
+    unsigned long long tb = 0; uint32_t wb = 0; int wn = 0; uint32_t mb = 0; int mn = 0;
     if (sscanf(v, "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", &tb, &wb, &wn, &mb, &mn) == 5) {
         e->total_bytes = tb; e->week_bytes = wb; e->week_no = wn; e->month_bytes = mb; e->month_no = mn;
     }
@@ -566,7 +566,7 @@ static void usage_save(usage_entry_t *e) {
 static void down_usage_load(void) {
     char v[96] = "";
     nvs_get_string("down_total", v, sizeof(v), "");
-    unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
+    unsigned long long tb = 0; uint32_t wb = 0; int wn = 0; uint32_t mb = 0; int mn = 0;
     if (sscanf(v, "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", &tb, &wb, &wn, &mb, &mn) == 5) {
         s_down_usage.total_bytes = tb; s_down_usage.week_bytes = wb; s_down_usage.week_no = wn;
         s_down_usage.month_bytes = mb; s_down_usage.month_no = mn;
