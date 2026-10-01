@@ -39,12 +39,18 @@ footer a{color:#7fd9bd;text-decoration:none}
 .mbox .q{margin-top:14px;font-style:italic;color:#c9e7df;text-align:center}
 .mclose{position:absolute;top:8px;right:12px;background:none;border:none;color:#aaa;font-size:24px;cursor:pointer;width:auto;margin:0;padding:0}
 
-/* Chat Styling */
-#chatbox{height:200px;overflow-y:auto;background:#0c1416;border:1px solid #2c4a50;border-radius:8px;padding:10px;margin:10px 0;font-size:13px}
-.cmsg{margin:6px 0;padding:8px 10px;border-radius:6px;word-break:break-word}
-.cuser{background:#203a43;color:#eee;text-align:right;margin-left:15%}
+/* Fullscreen AI Overlay Styling */
+.ai-modal{position:fixed;inset:0;background:#0c1416;display:none;flex-direction:column;z-index:99;padding:15px}
+.ai-modal.on{display:flex}
+.ai-header{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2c4a50;padding-bottom:10px;margin-bottom:10px}
+.ai-header h2{margin:0;color:#00e0a0;font-size:1.2em}
+#chatbox{flex:1;overflow-y:auto;background:#0f1a1d;border:1px solid #2c4a50;border-radius:8px;padding:12px;margin:10px 0;font-size:14px}
+.cmsg{margin:8px 0;padding:10px 12px;border-radius:8px;word-break:break-word;line-height:1.4}
+.cuser{background:#203a43;color:#eee;text-align:right;margin-left:20%}
 .cai{background:#06201a;color:#7fd9bd;border:1px solid #00e0a0;margin-right:15%}
 .cerr{background:#3a1c1c;color:#ff8080}
+.ai-inputs{display:flex;flex-direction:column;gap:8px}
+.ai-row{display:flex;gap:8px}
 </style>
 </head>
 <body>
@@ -95,22 +101,26 @@ footer a{color:#7fd9bd;text-decoration:none}
   </div>
 </div>
 
-<!-- AI Chat Modal -->
-<div class="modal" id="aimodal" onclick="if(event.target===this)closeAi()">
-  <div class="mbox">
-    <button class="mclose" onclick="closeAi()">&times;</button>
-    <h2>AI Assistant</h2>
-    <p style="font-size:0.8em;color:#9fb3b0;margin-bottom:8px">Powered by OpenRouter Free API</p>
-    
-    <div style="display:flex;gap:6px">
-      <input type="password" id="ak" placeholder="Enter OpenRouter Key" style="padding:8px;font-size:12px">
-      <button type="button" onclick="saveAk()" style="width:auto;margin:0;padding:8px 12px;font-size:12px;background:#23282a;color:#9fd8c8;border:1px solid #33474a">Save</button>
+<!-- Full Screen AI Chat Modal -->
+<div class="ai-modal" id="aimodal">
+  <div class="ai-header">
+    <div>
+      <h2>🤖 OpenRouter Fast AI</h2>
+      <span style="font-size:0.75em;color:#9fb3b0">High-Speed Response Mode</span>
     </div>
-    
-    <div id="chatbox"></div>
-    
-    <input type="text" id="ci" placeholder="Ask something..." onkeypress="if(event.key==='Enter')sendAiMsg()" style="margin-bottom:8px">
-    <button type="button" onclick="sendAiMsg()" style="margin:0">Send Message</button>
+    <button class="mclose" style="position:static" onclick="closeAi()">&times;</button>
+  </div>
+  
+  <div class="ai-row">
+    <input type="password" id="ak" placeholder="Enter OpenRouter API Key" style="padding:8px;font-size:12px">
+    <button type="button" onclick="saveAk()" style="width:auto;margin:0;padding:8px 12px;font-size:12px;background:#23282a;color:#9fd8c8;border:1px solid #33474a">Save Key</button>
+  </div>
+  
+  <div id="chatbox"></div>
+  
+  <div class="ai-inputs">
+    <input type="text" id="ci" placeholder="Type message..." onkeypress="if(event.key==='Enter')sendAiMsg()">
+    <button type="button" onclick="sendAiMsg()" style="margin:0">Send</button>
   </div>
 </div>
 
@@ -151,7 +161,7 @@ async function sendAiMsg(){
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        'model': 'openrouter/free',
+        'model': 'google/gemini-2.0-flash-lite:free',
         'messages': [{'role': 'user', 'content': txt}]
       })
     });
