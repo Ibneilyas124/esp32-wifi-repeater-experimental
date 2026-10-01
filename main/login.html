@@ -1,104 +1,187 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 WiFi Repeater - Login</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #121212; color: #fff; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; box-sizing: border-box; }
-        .card { background: #1e1e1e; padding: 25px; border-radius: 10px; width: 100%; max-width: 350px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); text-align: center; }
-        h2 { margin-bottom: 20px; color: #007bff; }
-        input[type="text"], input[type="password"] { width: 100%; padding: 12px; margin: 8px 0; background: #2a2a2a; border: 1px solid #444; color: #fff; border-radius: 5px; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #007bff; border: none; color: white; border-radius: 5px; font-size: 16px; cursor: pointer; margin-top: 10px; font-weight: bold; }
-        button:hover { background: #0056b3; }
-        
-        /* Floating AI Chat Button & Box */
-        .ai-toggle-btn { background: #28a745; margin-top: 15px; }
-        .ai-toggle-btn:hover { background: #218838; }
-        #aiModal { display: none; margin-top: 20px; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 15px; text-align: left; }
-        #chatbox { height: 200px; overflow-y: auto; background: #000; border: 1px solid #333; border-radius: 5px; padding: 10px; margin: 10px 0; font-size: 14px; }
-        .msg { margin: 5px 0; padding: 6px 10px; border-radius: 5px; word-wrap: break-word; }
-        .user { background: #007bff; text-align: right; margin-left: 20%; }
-        .ai { background: #28a745; text-align: left; margin-right: 20%; }
-        .err { background: #dc3545; }
-        .key-input { font-size: 12px; margin-bottom: 5px; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ibn e Ilyas Technologies - WiFi Repeater</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);display:flex;align-items:center;
+justify-content:center;padding:20px;color:#eee}
+.wrap{width:100%;max-width:420px}
+.brand{text-align:center;margin-bottom:22px}
+.badge{display:inline-block;background:linear-gradient(135deg,#00e0a0,#00a3ff);width:58px;height:58px;
+border-radius:16px;line-height:58px;font-size:28px;margin-bottom:10px}
+.brand h1{font-size:1.2em;margin:4px 0 2px;color:#fff;line-height:1.35}
+.brand p{margin:0;color:#9fd8c8;font-size:.9em}
+section{background:rgba(20,25,30,.78);border:1px solid rgba(255,255,255,.08);border-radius:14px;
+padding:22px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+label{display:block;font-size:.8em;color:#9fb3b0;margin:12px 0 4px}
+input{width:100%;padding:12px;border-radius:8px;border:1px solid #33474a;background:#0f1a1d;color:#eee;font-size:15px}
+input[readonly]{color:#7fd9bd;background:#0c1416}
+input:focus{outline:none;border-color:#00e0a0}
+button{width:100%;margin-top:18px;padding:13px;border:none;border-radius:8px;
+background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;font-weight:bold;font-size:15px;cursor:pointer}
+button:active{opacity:.85}
+#err{color:#ff8080;font-size:.85em;min-height:18px;margin-top:10px;text-align:center}
+footer{text-align:center;margin-top:18px;color:#6c8a86;font-size:.85em}
+footer a{color:#7fd9bd;text-decoration:none}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;padding:16px;z-index:9}
+.modal.on{display:flex}
+.mbox{background:#141b1e;border:1px solid #2c4a50;border-radius:14px;max-width:420px;width:100%;max-height:92vh;overflow:auto;padding:20px;position:relative}
+.mbox h2{margin:0 0 4px;color:#00e0a0;font-size:1.15em}
+.mbox h3{margin:14px 0 6px;color:#9fd8c8;font-size:.95em}
+.mbox .nm{font-size:1.3em;font-weight:700;margin-bottom:8px}
+.mbox p{margin:5px 0;font-size:.92em;word-break:break-word}
+.mbox a{color:#7fd9bd}
+.mbox ul{margin:0;padding-left:18px;font-size:.92em;line-height:1.6}
+.mbox .q{margin-top:14px;font-style:italic;color:#c9e7df;text-align:center}
+.mclose{position:absolute;top:8px;right:12px;background:none;border:none;color:#aaa;font-size:24px;cursor:pointer;width:auto;margin:0;padding:0}
+
+/* Chat Styling */
+#chatbox{height:200px;overflow-y:auto;background:#0c1416;border:1px solid #2c4a50;border-radius:8px;padding:10px;margin:10px 0;font-size:13px}
+.cmsg{margin:6px 0;padding:8px 10px;border-radius:6px;word-break:break-word}
+.cuser{background:#203a43;color:#eee;text-align:right;margin-left:15%}
+.cai{background:#06201a;color:#7fd9bd;border:1px solid #00e0a0;margin-right:15%}
+.cerr{background:#3a1c1c;color:#ff8080}
+</style>
 </head>
 <body>
-
-    <div class="card">
-        <h2>ESP32 Repeater</h2>
-        <form action="/login" method="POST">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
-
-        <!-- AI Assistant Without Login -->
-        <button type="button" class="ai-toggle-btn" onclick="toggleAI()">🤖 Open AI Assistant</button>
-
-        <div id="aiModal">
-            <h4 style="margin:0 0 10px 0;">Free AI Chat (OpenRouter)</h4>
-            <input type="password" id="apiKey" class="key-input" placeholder="Enter OpenRouter API Key">
-            <button type="button" onclick="saveKey()" style="padding: 5px; font-size:12px; background:#555; margin-top:0;">Save Key</button>
-            
-            <div id="chatbox"></div>
-            
-            <input type="text" id="userInput" placeholder="Ask AI anything..." onkeypress="if(event.key==='Enter') sendMsg()">
-            <button type="button" onclick="sendMsg()" style="padding:8px; font-size:14px;">Send</button>
-        </div>
+<div class="wrap">
+  <div class="brand">
+    <div class="badge">&#128225;</div>
+    <h1>This WiFi Repeater was built by<br>Sarfraz Qureshi</h1>
+    <p>Ibn e Ilyas Technologies &middot; Secure Admin Access</p>
+  </div>
+  <section>
+    <label>Username</label>
+    <input id="u" value="Sarfraz" readonly>
+    <label>Password</label>
+    <div style="position:relative">
+      <input id="p" type="password" placeholder="Enter admin password" autofocus style="padding-right:44px">
+      <button type="button" onclick="togglePw()" style="position:absolute;right:4px;top:4px;bottom:4px;width:38px;margin:0;padding:0;background:#23282a;color:#9fd8c8;border:1px solid #33474a;border-radius:6px;font-size:13px;cursor:pointer">SHOW</button>
     </div>
+    <button onclick="doLogin()">Login</button>
+    <div id="err"></div>
+  </section>
+  <footer>
+    <a href="#" onclick="openAbout();return false">About Developer</a> &nbsp;&middot;&nbsp; 
+    <a href="/tools">&#128295; WiFi Tools</a> &nbsp;&middot;&nbsp; 
+    <a href="#" onclick="openAi();return false">&#129302; AI Chat</a><br>
+    <span id="diagLine" style="opacity:.6"></span>
+  </footer>
+</div>
 
-    <script>
-        document.getElementById('apiKey').value = localStorage.getItem('openrouter_key') || '';
+<!-- About Modal -->
+<div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
+  <div class="mbox">
+    <button class="mclose" onclick="closeAbout()">&times;</button>
+    <h2>About Developer</h2>
+    <div class="nm">Sarfraz Qureshi</div>
+    <p>&#128205; Naushehro Feroz, Sindh, Pakistan</p>
+    <p>&#128231; <a href="mailto:ahmedsarfraz650@gmail.com">ahmedsarfraz650@gmail.com</a></p>
+    <p>&#128172; WhatsApp: <a href="https://wa.me/923043478576">+92 304 3478576</a></p>
+    <p>&#127760; GitHub: <a href="https://github.com/Ibneilyas124">Ibneilyas124</a></p>
+    <h3>Skills</h3>
+    <ul>
+      <li>Arduino &amp; Embedded Systems</li>
+      <li>Circuit Design, Soldering &amp; Programming</li>
+      <li>Hardware &amp; Software Troubleshooting</li>
+      <li>IoT &amp; Wi-Fi Projects</li>
+      <li>Cybersecurity</li>
+    </ul>
+    <div class="q">&ldquo;Build it. Break it. Fix it. Learn from it.&rdquo;</div>
+  </div>
+</div>
 
-        function toggleAI() {
-            const m = document.getElementById('aiModal');
-            m.style.display = (m.style.display === 'block') ? 'none' : 'block';
-        }
+<!-- AI Chat Modal -->
+<div class="modal" id="aimodal" onclick="if(event.target===this)closeAi()">
+  <div class="mbox">
+    <button class="mclose" onclick="closeAi()">&times;</button>
+    <h2>AI Assistant</h2>
+    <p style="font-size:0.8em;color:#9fb3b0;margin-bottom:8px">Powered by OpenRouter Free API</p>
+    
+    <div style="display:flex;gap:6px">
+      <input type="password" id="ak" placeholder="Enter OpenRouter Key" style="padding:8px;font-size:12px">
+      <button type="button" onclick="saveAk()" style="width:auto;margin:0;padding:8px 12px;font-size:12px;background:#23282a;color:#9fd8c8;border:1px solid #33474a">Save</button>
+    </div>
+    
+    <div id="chatbox"></div>
+    
+    <input type="text" id="ci" placeholder="Ask something..." onkeypress="if(event.key==='Enter')sendAiMsg()" style="margin-bottom:8px">
+    <button type="button" onclick="sendAiMsg()" style="margin:0">Send Message</button>
+  </div>
+</div>
 
-        function saveKey() {
-            const k = document.getElementById('apiKey').value.trim();
-            localStorage.setItem('openrouter_key', k);
-            alert('API Key saved locally!');
-        }
+<script>
+function openAbout(){document.getElementById('about').classList.add('on');}
+function closeAbout(){document.getElementById('about').classList.remove('on');}
 
-        async function sendMsg() {
-            const k = localStorage.getItem('openrouter_key') || document.getElementById('apiKey').value.trim();
-            if (!k) { alert('Please enter and save your OpenRouter API Key first!'); return; }
+function openAi(){
+  document.getElementById('ak').value = localStorage.getItem('or_key') || '';
+  document.getElementById('aimodal').classList.add('on');
+}
+function closeAi(){document.getElementById('aimodal').classList.remove('on');}
 
-            const inp = document.getElementById('userInput');
-            const txt = inp.value.trim();
-            if (!txt) return;
+function saveAk(){
+  const k = document.getElementById('ak').value.trim();
+  localStorage.setItem('or_key', k);
+  alert('Key Saved!');
+}
 
-            const box = document.getElementById('chatbox');
-            box.innerHTML += `<div class="msg user">${txt}</div>`;
-            inp.value = '';
-            box.scrollTop = box.scrollHeight;
+async function sendAiMsg(){
+  const k = localStorage.getItem('or_key') || document.getElementById('ak').value.trim();
+  if(!k){ alert('Please enter & save OpenRouter API key first!'); return; }
+  
+  const inp = document.getElementById('ci');
+  const txt = inp.value.trim();
+  if(!txt) return;
 
-            try {
-                const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${k}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        'model': 'meta-llama/llama-3.3-70b-instruct:free',
-                        'messages': [{ 'role': 'user', 'content': txt }]
-                    })
-                });
-                const d = await res.json();
-                if (d.choices && d.choices[0]) {
-                    box.innerHTML += `<div class="msg ai">${d.choices[0].message.content}</div>`;
-                } else {
-                    box.innerHTML += `<div class="msg err">${d.error?.message || 'Error occurred'}</div>`;
-                }
-            } catch (e) {
-                box.innerHTML += `<div class="msg err">Request Failed</div>`;
-            }
-            box.scrollTop = box.scrollHeight;
-        }
-    </script>
+  const box = document.getElementById('chatbox');
+  box.innerHTML += `<div class="cmsg cuser">${txt}</div>`;
+  inp.value = '';
+  box.scrollTop = box.scrollHeight;
 
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${k}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        'model': 'meta-llama/llama-3.3-70b-instruct:free',
+        'messages': [{'role': 'user', 'content': txt}]
+      })
+    });
+    const d = await res.json();
+    if (d.choices && d.choices[0]) {
+      box.innerHTML += `<div class="cmsg cai">${d.choices[0].message.content}</div>`;
+    } else {
+      box.innerHTML += `<div class="cmsg cerr">${d.error?.message || 'Error occurred'}</div>`;
+    }
+  } catch(e) {
+    box.innerHTML += `<div class="cmsg cerr">Request Failed</div>`;
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+fetch('/api/me').then(function(r){return r.json();}).then(function(j){
+  document.getElementById('diagLine').textContent='fw v'+j.fw+' \u00b7 factory resets: '+j.reset_count;
+}).catch(function(){});
+
+async function doLogin(){
+  const e=document.getElementById('err'); e.textContent='';
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
+    const j=await r.json();
+    if(j.ok){ location.href='/admin'; } else { e.textContent='Wrong password'; }
+  }catch(x){ e.textContent='Could not reach the repeater'; }
+}
+document.getElementById('p').addEventListener('keydown',function(ev){ if(ev.key==='Enter') doLogin(); });
+function togglePw(){ var i=document.getElementById('p'); var b=event.target; if(i.type==='password'){i.type='text';b.textContent='HIDE';} else {i.type='password';b.textContent='SHOW';} }
+</script>
 </body>
 </html>
