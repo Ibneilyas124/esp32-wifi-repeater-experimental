@@ -156,9 +156,16 @@ async function loadSpeedHistory(){
 
 var hasInternet = null;
 async function checkOwnInternet(){
+  /* A pure reachability probe (mode:'no-cors' to a tiny, extremely reliable
+   * endpoint) - this only tells us whether THIS device can reach the open
+   * internet at all. It deliberately does NOT use api.macvendors.com for
+   * this check: that service can reject a request (e.g. a malformed MAC,
+   * or its own rate limit) without CORS headers on the error response,
+   * which makes the browser report it as a network failure even when the
+   * device's internet is completely fine - a false positive. */
   try{
-    var ac=new AbortController(); var tm=setTimeout(function(){ac.abort();},3000);
-    await fetch('https://api.macvendors.com/00:00:00:00:00:00',{cache:'no-store',signal:ac.signal});
+    var ac=new AbortController(); var tm=setTimeout(function(){ac.abort();},4000);
+    await fetch('https://www.gstatic.com/generate_204',{mode:'no-cors',cache:'no-store',signal:ac.signal});
     clearTimeout(tm); hasInternet=true;
   }catch(e){ hasInternet=false; }
   var b=$('netBanner');
@@ -321,12 +328,18 @@ async function lookupOnline(){
   await doLookup(todo);
 }
 async function doLookup(todo){
-  var done=0;
+  var done=0, failed=0;
   for(var i=0;i<todo.length;i++){
-    try{ var r=await fetch('https://api.macvendors.com/'+encodeURIComponent(todo[i].bssid)); if(r.ok){ todo[i].vendor=(await r.text()).trim(); done++; } }catch(e){ $('onlineMsg').textContent='Online lookup unavailable right now (needs internet on this device).'; renderNets(); return; }
+    try{
+      var r=await fetch('https://api.macvendors.com/'+encodeURIComponent(todo[i].bssid));
+      if(r.ok){ todo[i].vendor=(await r.text()).trim(); done++; }
+      else if(r.status===429){ $('onlineMsg').textContent='The lookup service is rate-limiting us - try "Look up more" again in a minute.'; break; }
+    }catch(e){ failed++; }  /* one bad lookup shouldn't stop the rest */
     $('onlineMsg').textContent='Looked up '+(i+1)+'/'+todo.length+'...'; renderNets(); await sleep(1200);
   }
-  $('onlineMsg').textContent=done?('Done - found '+done+'.'):'No matches found for the remaining networks.';
+  if(failed && hasInternet===false) $('onlineMsg').textContent='This device has no internet, so online lookups can\'t work - see the notice above.';
+  else if(failed) $('onlineMsg').textContent=done?('Done - found '+done+', '+failed+' lookup(s) failed.'):'The lookup service did not respond for these - try again shortly.';
+  else $('onlineMsg').textContent=done?('Done - found '+done+'.'):'No matches found for the remaining networks.';
   renderNets();
 }
 

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Chat - Ibn e Ilyas Technologies</title>
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:#0d0f10;color:#e8e8e8;font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column}
+header{padding:12px 14px;border-bottom:1px solid #262b2d;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:1.05em;margin:0;color:#00e0a0}
+header a{color:#7fd9bd;text-decoration:none;font-size:.85em}
+#log{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:82%;padding:10px 13px;border-radius:12px;line-height:1.45;font-size:14.5px;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:linear-gradient(135deg,#00e0a0,#00a3ff);color:#06201a;border-bottom-right-radius:3px}
+.msg.bot{align-self:flex-start;background:#171b1c;border:1px solid #262b2d;border-bottom-left-radius:3px}
+.msg.err{align-self:flex-start;background:#2a1414;border:1px solid #4a1f1f;color:#ff9c9c}
+.typing{align-self:flex-start;color:#7d8a88;font-size:13px;padding:4px 13px}
+footer{padding:10px;border-top:1px solid #262b2d;display:flex;gap:8px}
+#box{flex:1;background:#171b1c;color:#eee;border:1px solid #33393c;border-radius:10px;padding:11px;font-size:15px;resize:none;max-height:100px}
+#send{background:#00e0a0;color:#06201a;border:none;border-radius:10px;padding:0 18px;font-weight:700;cursor:pointer}
+#send:disabled{opacity:.5}
+#clearBtn{background:none;border:none;color:#7d8a88;font-size:.8em;cursor:pointer;text-decoration:underline}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#129302; AI Chat</h1>
+  <div><button id="clearBtn" onclick="clearChat()">Clear</button> &nbsp; <a href="/">Admin login</a></div>
+</header>
+<div id="log"></div>
+<footer>
+  <textarea id="box" rows="1" placeholder="Message..." onkeydown="onKey(event)"></textarea>
+  <button id="send" onclick="send()">Send</button>
+</footer>
+<script>
+var KEY='repeater_ai_chat_history_v1';
+var history=[];
+try{ var saved=localStorage.getItem(KEY); if(saved) history=JSON.parse(saved); }catch(e){}
+
+function $(i){return document.getElementById(i);}
+function save(){ try{ localStorage.setItem(KEY, JSON.stringify(history.slice(-40))); }catch(e){} }
+function render(){
+  var log=$('log'); log.innerHTML='';
+  history.forEach(function(m){
+    var d=document.createElement('div');
+    d.className='msg '+(m.role==='user'?'user':(m.role==='error'?'err':'bot'));
+    d.textContent=m.content;
+    log.appendChild(d);
+  });
+  log.scrollTop=log.scrollHeight;
+}
+function clearChat(){ if(confirm('Clear this chat? (Only clears this browser - nothing is stored on the repeater.)')){ history=[]; save(); render(); } }
+function onKey(e){ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); } }
+
+async function send(){
+  var box=$('box'); var text=box.value.trim(); if(!text) return;
+  box.value=''; $('send').disabled=true;
+  history.push({role:'user',content:text}); save(); render();
+
+  var log=$('log'); var typ=document.createElement('div'); typ.className='typing'; typ.textContent='Thinking...'; log.appendChild(typ); log.scrollTop=log.scrollHeight;
+
+  try{
+    var apiMsgs=history.filter(function(m){return m.role==='user'||m.role==='assistant';}).slice(-20)
+      .map(function(m){return {role:m.role,content:m.content};});
+    var r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({messages:apiMsgs})});
+    var j=await r.json();
+    typ.remove();
+    if(j.ok){ history.push({role:'assistant',content:j.reply}); }
+    else { history.push({role:'error',content:j.error||'Something went wrong.'}); }
+  }catch(e){
+    typ.remove();
+    history.push({role:'error',content:'Could not reach the repeater. Check your connection and try again.'});
+  }
+  save(); render(); $('send').disabled=false; box.focus();
+}
+render();
+</script>
+</body>
+</html>

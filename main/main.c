@@ -28,6 +28,8 @@
 #include "esp_private/wifi.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_sntp.h"
 #include <time.h>
 #include "esp_timer.h"
@@ -50,6 +52,7 @@ static const char *TAG = "repeater";
 extern const char login_html_start[] asm("_binary_login_html_start");
 extern const char admin_html_start[] asm("_binary_admin_html_start");
 extern const char tools_html_start[] asm("_binary_tools_html_start");
+extern const char chat_html_start[] asm("_binary_chat_html_start");
 
 #define FW_VERSION "2.1.0"
 
@@ -88,6 +91,18 @@ typedef struct {
 } usage_entry_t;
 static usage_entry_t s_usage[TRACK_MAX];
 static bool s_time_synced = false;
+
+/* ---- repeater-wide (all devices combined) download tracking + rate cap.
+ * Unlike per-device usage above, this is measured on the upstream (STA)
+ * side, so it is the one number in this firmware that genuinely reflects
+ * real internet usage in BOTH directions for the whole repeater - not just
+ * uploads. It cannot be split back out per device (no public API exposes
+ * the NAT table), so it is reported and capped in aggregate only. */
+static usage_entry_t s_down_usage;           /* .mac unused - whole-repeater totals */
+static uint32_t s_down_bucket_tokens = 0;
+static int64_t s_down_bucket_last_us = 0;
+static uint32_t s_up_bucket_tokens = 0;       /* overall (all-clients) uplink bucket */
+static int64_t s_up_bucket_last_us = 0;
 
 /* ---- speed-history: periodic latency samples to 1.1.1.1 (every ~15 min) ---- */
 #define SPEEDHIST_MAX 48
@@ -128,6 +143,12 @@ static const setting_t SETTINGS[] = {
     {"sta_gateway", "Static IP: main router's address", "",                         "text",          "Required only if Remote-management IP above is set. Usually the main router's own IP"},
     {"sta_netmask", "Static IP: subnet mask",            "255.255.255.0",            "text",          "Required only if Remote-management IP above is set. Leave default unless you know why"},
     {"auto_reboot_hours","Auto-restart every N hours",   "0",                        "number",        "0 = never. Otherwise the repeater reboots itself every N hours (1-168) to stay fresh"},
+    {"overall_up_kbps",  "Overall upload cap (all devices)", "0",                    "number",        "0 = unlimited. Total upload speed shared by every connected device combined, in Kbps"},
+    {"overall_down_kbps","Overall download cap (all devices)","0",                   "number",        "0 = unlimited. Total download/streaming speed shared by every connected device combined, in Kbps"},
+    {"ai_enabled",  "Enable public AI chat (/chat)",     "0",                        "bool",          "OFF by default. Anyone connected can use it once ON - it spends YOUR API key's money per message"},
+    {"ai_api_key",  "AI API key",                        "",                         "password",      "Your own OpenAI (or compatible) API key. Stored only on this device, never shown to chat users"},
+    {"ai_model",    "AI model name",                     "gpt-4o-mini",              "text",          "e.g. gpt-4o-mini (cheap, fast) or gpt-4o (smarter, costs more)"},
+    {"ai_api_base", "AI API endpoint URL",                "https://api.openai.com/v1/chat/completions", "text", "Change only if pointing at a different OpenAI-compatible provider"},
     {"admin_pass", "Admin password",                   "admin",                    "password_keep", "4-32 characters. Leave blank to keep the current one"},
 };
 #define N_SETTINGS (sizeof(SETTINGS) / sizeof(SETTINGS[0]))
@@ -157,6 +178,35 @@ static void nvs_set_string(const char *key, const char *val) {
     }
 }
 
+/* Separate, never-wiped namespace, used only to PROVE a factory reset really
+ * happened (a reset counter) - since some default values (e.g. the WiFi
+ * name/password) look identical before and after a reset if they were never
+ * customised, which was confusing to verify otherwise. */
+#define DIAG_NS "repeater_diag"
+
+static int bump_reset_counter(void) {
+    nvs_handle_t h;
+    int32_t count = 0;
+    if (nvs_open(DIAG_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_get_i32(h, "resets", &count);
+        count++;
+        nvs_set_i32(h, "resets", count);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    return count;
+}
+
+static int get_reset_counter(void) {
+    nvs_handle_t h;
+    int32_t count = 0;
+    if (nvs_open(DIAG_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i32(h, "resets", &count);
+        nvs_close(h);
+    }
+    return count;
+}
+
 static void wipe_settings(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
@@ -164,6 +214,7 @@ static void wipe_settings(void) {
         nvs_commit(h);
         nvs_close(h);
     }
+    bump_reset_counter();
 }
 
 static const setting_t *find_setting(const char *key) {
@@ -254,6 +305,16 @@ static bool validate_setting(const char *key, const char *v, char *err, size_t n
         if (!valid_ipv4_any(v)) { snprintf(err, n, "must be a valid IPv4 mask like 255.255.255.0"); return false; }
     } else if (strcmp(key, "auto_reboot_hours") == 0) {
         if (!int_in_range(v, 0, 168)) { snprintf(err, n, "must be 0-168"); return false; }
+    } else if (strcmp(key, "overall_up_kbps") == 0 || strcmp(key, "overall_down_kbps") == 0) {
+        if (!int_in_range(v, 0, 9999)) { snprintf(err, n, "must be 0-9999 Kbps (0 = unlimited)"); return false; }
+    } else if (strcmp(key, "ai_enabled") == 0) {
+        if (strcmp(v, "0") != 0 && strcmp(v, "1") != 0) { snprintf(err, n, "must be 0 or 1"); return false; }
+    } else if (strcmp(key, "ai_model") == 0) {
+        if (len < 1 || len > 40) { snprintf(err, n, "must be 1-40 characters"); return false; }
+    } else if (strcmp(key, "ai_api_base") == 0) {
+        if (len < 9 || len > 127 || strncmp(v, "https://", 8) != 0) { snprintf(err, n, "must be a https:// URL"); return false; }
+    } else if (strcmp(key, "ai_api_key") == 0) {
+        if (len > 127) { snprintf(err, n, "too long (max 127 characters)"); return false; }
     } else if (strcmp(key, "guest_filter") == 0 || strcmp(key, "deauth_monitor") == 0) {
         if (strcmp(v, "0") != 0 && strcmp(v, "1") != 0) { snprintf(err, n, "must be 0 or 1"); return false; }
     } else if (strcmp(key, "deauth_alert") == 0) {
@@ -506,6 +567,24 @@ static void usage_save(usage_entry_t *e) {
     nvs_set_string(key, v);
 }
 
+/* whole-repeater download totals - persisted under a fixed NVS key */
+static void down_usage_load(void) {
+    char v[96] = "";
+    nvs_get_string("down_total", v, sizeof(v), "");
+    unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
+    if (sscanf(v, "%llu,%u,%d,%u,%d", &tb, &wb, &wn, &mb, &mn) == 5) {
+        s_down_usage.total_bytes = tb; s_down_usage.week_bytes = wb; s_down_usage.week_no = wn;
+        s_down_usage.month_bytes = mb; s_down_usage.month_no = mn;
+    }
+}
+
+static void down_usage_save(void) {
+    char v[96];
+    snprintf(v, sizeof(v), "%llu,%u,%d,%u,%d", (unsigned long long)s_down_usage.total_bytes,
+             s_down_usage.week_bytes, s_down_usage.week_no, s_down_usage.month_bytes, s_down_usage.month_no);
+    nvs_set_string("down_total", v);
+}
+
 /* finds a tracked device, creating a new slot (loaded from NVS) the first time it is seen */
 static usage_entry_t *usage_find_or_add(const uint8_t mac[6]) {
     for (int i = 0; i < TRACK_MAX; i++) {
@@ -538,13 +617,16 @@ static void usage_housekeeping(void) {
         if (s_usage[i].month_no != month_no) { s_usage[i].month_bytes = 0; s_usage[i].month_no = month_no; dirty = true; }
         if (dirty) { usage_save(&s_usage[i]); any_dirty = true; }
     }
-    (void)any_dirty;
+    if (s_down_usage.week_no != week_no) { s_down_usage.week_bytes = 0; s_down_usage.week_no = week_no; any_dirty = true; }
+    if (s_down_usage.month_no != month_no) { s_down_usage.month_bytes = 0; s_down_usage.month_no = month_no; any_dirty = true; }
+    if (any_dirty) down_usage_save();
 }
 
 static void usage_persist_all(void) {
     for (int i = 0; i < TRACK_MAX; i++) {
         if (s_usage[i].used) usage_save(&s_usage[i]);
     }
+    down_usage_save();
 }
 
 static void update_subnet_cache(void) {
@@ -587,6 +669,25 @@ static esp_err_t ap_rx_filter(void *buffer, uint16_t len, void *eb) {
                 }
                 ue->bucket_tokens -= len;
             }
+
+            int overall_up = get_setting_int("overall_up_kbps", 0, 9999, 0);
+            if (overall_up > 0) {
+                int64_t now2 = esp_timer_get_time();
+                if (s_up_bucket_last_us == 0) s_up_bucket_last_us = now2;
+                int64_t dt2 = now2 - s_up_bucket_last_us;
+                if (dt2 > 0) {
+                    uint64_t refill2 = (uint64_t)dt2 * (uint32_t)overall_up * 1000ULL / 8ULL / 1000000ULL;
+                    uint32_t cap2 = (uint32_t)overall_up * 1000 / 8;
+                    uint64_t nt2 = (uint64_t)s_up_bucket_tokens + refill2;
+                    s_up_bucket_tokens = nt2 > cap2 ? cap2 : (uint32_t)nt2;
+                    s_up_bucket_last_us = now2;
+                }
+                if (s_up_bucket_tokens < len) {
+                    esp_wifi_internal_free_rx_buffer(eb);  /* over the shared overall uplink cap */
+                    return ESP_OK;
+                }
+                s_up_bucket_tokens -= len;
+            }
         }
         esp_netif_receive(s_ap_netif, buffer, len, eb);
         return ESP_OK;
@@ -605,6 +706,41 @@ static esp_err_t ap_rx_filter(void *buffer, uint16_t len, void *eb) {
     } else {
         esp_wifi_internal_free_rx_buffer(eb);
     }
+    return ESP_OK;
+}
+
+/* ---- Whole-repeater download counter + optional overall download cap.
+ * Registered on the STA (upstream) interface. Unlike ap_rx_filter, this
+ * ALWAYS forwards every packet unchanged when no cap is set (default) - it
+ * only ever drops packets when the admin has explicitly set a download cap
+ * greater than 0, so normal internet sharing is completely unaffected
+ * unless this is turned on. Must be re-armed after every STA (re)connect,
+ * because ESP-IDF's own networking glue re-registers its own default
+ * receive callback each time the STA reconnects. */
+static esp_err_t sta_rx_counter(void *buffer, uint16_t len, void *eb) {
+    s_down_usage.total_bytes += len;
+    s_down_usage.week_bytes += len;
+    s_down_usage.month_bytes += len;
+
+    int overall_down = get_setting_int("overall_down_kbps", 0, 9999, 0);
+    if (overall_down > 0) {
+        int64_t now = esp_timer_get_time();
+        if (s_down_bucket_last_us == 0) s_down_bucket_last_us = now;
+        int64_t dt = now - s_down_bucket_last_us;
+        if (dt > 0) {
+            uint64_t refill = (uint64_t)dt * (uint32_t)overall_down * 1000ULL / 8ULL / 1000000ULL;
+            uint32_t cap = (uint32_t)overall_down * 1000 / 8;
+            uint64_t nt = (uint64_t)s_down_bucket_tokens + refill;
+            s_down_bucket_tokens = nt > cap ? cap : (uint32_t)nt;
+            s_down_bucket_last_us = now;
+        }
+        if (s_down_bucket_tokens < len) {
+            esp_wifi_internal_free_rx_buffer(eb);   /* over the overall download cap */
+            return ESP_OK;
+        }
+        s_down_bucket_tokens -= len;
+    }
+    esp_netif_receive(s_sta_netif, buffer, len, eb);
     return ESP_OK;
 }
 
@@ -658,6 +794,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         case WIFI_EVENT_STA_START:
             esp_wifi_connect();
             break;
+        case WIFI_EVENT_STA_CONNECTED: {
+            /* ESP-IDF's own netif glue re-registers its default STA receive
+             * callback on every connect, silently overwriting ours - so we
+             * must re-arm our download counter/cap right after, every time. */
+            esp_err_t re = esp_wifi_internal_reg_rxcb(WIFI_IF_STA, sta_rx_counter);
+            ESP_LOGI(TAG, "Download counter armed: %s", esp_err_to_name(re));
+            break;
+        }
         case WIFI_EVENT_STA_DISCONNECTED: {
             wifi_event_sta_disconnected_t *dc = (wifi_event_sta_disconnected_t *)data;
             s_sta_connected = false;
@@ -1296,6 +1440,8 @@ static esp_err_t kick_post_handler(httpd_req_t *req) {
 static esp_err_t me_get_handler(httpd_req_t *req) {
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "admin", check_session(req));
+    cJSON_AddStringToObject(r, "fw", FW_VERSION);
+    cJSON_AddNumberToObject(r, "reset_count", get_reset_counter());
     return send_json(req, r);
 }
 
@@ -1303,6 +1449,119 @@ static esp_err_t tools_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, tools_html_start, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+static esp_err_t chat_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, chat_html_start, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* ================= AI chat (public - no login - opt-in) ================= */
+
+#define AI_RESP_CAP 8192
+
+typedef struct { char *buf; int len; int cap; } http_resp_buf_t;
+
+static esp_err_t chat_http_event_handler(esp_http_client_event_t *evt) {
+    if (evt->event_id == HTTP_EVENT_ON_DATA) {
+        http_resp_buf_t *rb = (http_resp_buf_t *)evt->user_data;
+        if (rb && rb->buf && rb->len + evt->data_len < rb->cap - 1) {
+            memcpy(rb->buf + rb->len, evt->data, evt->data_len);
+            rb->len += evt->data_len;
+            rb->buf[rb->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t chat_post_handler(httpd_req_t *req) {
+    char en[4]; get_setting("ai_enabled", en, sizeof(en));
+    if (en[0] != '1') return send_result(req, false, "AI chat is currently turned off by the repeater admin");
+
+    char api_key[128]; get_setting("ai_api_key", api_key, sizeof(api_key));
+    if (api_key[0] == '\0') return send_result(req, false, "AI chat is on, but no API key has been set yet - ask the admin to add one in Advanced Settings");
+
+    char model[40]; get_setting("ai_model", model, sizeof(model));
+    char base[128]; get_setting("ai_api_base", base, sizeof(base));
+
+    char *body = malloc(4096);
+    if (!body) { httpd_resp_send_500(req); return ESP_OK; }
+    read_body(req, body, 4096);
+    cJSON *in = cJSON_Parse(body);
+    free(body);
+    if (!in) return send_result(req, false, "invalid request");
+
+    cJSON *msgs = cJSON_GetObjectItem(in, "messages");
+    if (!cJSON_IsArray(msgs) || cJSON_GetArraySize(msgs) == 0) {
+        cJSON_Delete(in);
+        return send_result(req, false, "invalid request");
+    }
+
+    cJSON *payload = cJSON_CreateObject();
+    cJSON_AddStringToObject(payload, "model", model);
+    cJSON_AddItemToObject(payload, "messages", cJSON_Duplicate(msgs, true));
+    cJSON_AddNumberToObject(payload, "max_tokens", 500);
+    cJSON_Delete(in);
+    char *payload_str = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    if (!payload_str) { httpd_resp_send_500(req); return ESP_OK; }
+
+    http_resp_buf_t rb = { .cap = AI_RESP_CAP, .len = 0 };
+    rb.buf = malloc(AI_RESP_CAP);
+    if (!rb.buf) { free(payload_str); httpd_resp_send_500(req); return ESP_OK; }
+    rb.buf[0] = '\0';
+
+    esp_http_client_config_t config = {
+        .url = base,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 25000,
+        .event_handler = chat_http_event_handler,
+        .user_data = &rb,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    char auth_hdr[160];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", api_key);
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+    esp_http_client_set_post_field(client, payload_str, strlen(payload_str));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(payload_str);
+
+    if (err != ESP_OK) {
+        char e[100]; snprintf(e, sizeof(e), "could not reach the AI service: %s", esp_err_to_name(err));
+        free(rb.buf);
+        return send_result(req, false, e);
+    }
+    if (status != 200) {
+        char e[150]; snprintf(e, sizeof(e), "AI service returned an error (HTTP %d) - check the API key/model in Advanced Settings", status);
+        free(rb.buf);
+        return send_result(req, false, e);
+    }
+
+    cJSON *resp = cJSON_Parse(rb.buf);
+    free(rb.buf);
+    if (!resp) return send_result(req, false, "AI service sent an unreadable response");
+
+    cJSON *choices = cJSON_GetObjectItem(resp, "choices");
+    cJSON *first = cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
+    cJSON *msgobj = first ? cJSON_GetObjectItem(first, "message") : NULL;
+    cJSON *content = msgobj ? cJSON_GetObjectItem(msgobj, "content") : NULL;
+
+    cJSON *out = cJSON_CreateObject();
+    if (cJSON_IsString(content)) {
+        cJSON_AddBoolToObject(out, "ok", true);
+        cJSON_AddStringToObject(out, "reply", content->valuestring);
+    } else {
+        cJSON_AddBoolToObject(out, "ok", false);
+        cJSON_AddStringToObject(out, "error", "AI service response did not include a reply");
+    }
+    cJSON_Delete(resp);
+    return send_json(req, out);
 }
 
 /* ================= WiFi Analyzer (scan) ================= */
@@ -1603,6 +1862,26 @@ static esp_err_t usage_get_handler(httpd_req_t *req) {
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddItemToObject(root, "devices", arr);
+
+    /* Whole-repeater totals (both directions). This is the only figure here
+     * that includes downloads/streaming - per-device figures above are
+     * uploads only (see FEATURES.md for why). */
+    double up_total = 0, up_week = 0, up_month = 0;
+    for (int i = 0; i < TRACK_MAX; i++) {
+        if (!s_usage[i].used) continue;
+        up_total += (double)s_usage[i].total_bytes;
+        up_week += s_usage[i].week_bytes;
+        up_month += s_usage[i].month_bytes;
+    }
+    cJSON *overall = cJSON_CreateObject();
+    cJSON_AddNumberToObject(overall, "upload_total_bytes", up_total);
+    cJSON_AddNumberToObject(overall, "upload_week_bytes", up_week);
+    cJSON_AddNumberToObject(overall, "upload_month_bytes", up_month);
+    cJSON_AddNumberToObject(overall, "download_total_bytes", (double)s_down_usage.total_bytes);
+    cJSON_AddNumberToObject(overall, "download_week_bytes", s_down_usage.week_bytes);
+    cJSON_AddNumberToObject(overall, "download_month_bytes", s_down_usage.month_bytes);
+    cJSON_AddItemToObject(root, "overall", overall);
+
     return send_json(req, root);
 }
 
@@ -1664,6 +1943,8 @@ static void start_webserver(void) {
         {.uri = "/api/kick",           .method = HTTP_POST, .handler = kick_post_handler},
         {.uri = "/api/me",             .method = HTTP_GET,  .handler = me_get_handler},
         {.uri = "/tools",              .method = HTTP_GET,  .handler = tools_get_handler},
+        {.uri = "/chat",                .method = HTTP_GET,  .handler = chat_get_handler},
+        {.uri = "/api/chat",            .method = HTTP_POST, .handler = chat_post_handler},
         {.uri = "/api/scan/start",     .method = HTTP_POST, .handler = scan_start_post_handler},
         {.uri = "/api/scan",           .method = HTTP_GET,  .handler = scan_get_handler},
         {.uri = "/api/deauth",         .method = HTTP_GET,  .handler = deauth_get_handler},
@@ -1690,6 +1971,8 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    down_usage_load();
 
     s_boot_time_us = esp_timer_get_time();
     wifi_init();

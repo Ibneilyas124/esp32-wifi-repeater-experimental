@@ -60,9 +60,12 @@ label{font-size:13px;color:#b8c4c2;display:block;margin-top:8px}
   <button onclick="addMac()">Add to Whitelist</button>
 </div>
 
-<details class="card" id="usageCard"><summary>Data usage (whitelisted devices)</summary>
+<details class="card" id="usageCard"><summary>Data usage</summary>
   <small class="h" id="usageNote"></small>
+  <div id="overallUsage" style="margin-bottom:10px"></div>
+  <div class="k" style="margin:6px 0 2px">Per-device (upload only - see note below)</div>
   <div id="usageBody">Open this to load.</div>
+  <small class="h" style="margin-top:8px">Per-device rows only count what each device SENDS (uploads). The "Whole repeater" figures above include everything - downloads, streaming, browsing - but can't be split back out per device on this hardware. See FEATURES.md for why.</small>
 </details>
 
 <details class="card" id="shCard"><summary>Internet speed history (last 12 hours)</summary>
@@ -124,8 +127,16 @@ document.getElementById('usageCard').addEventListener('toggle',function(){ if(th
 async function loadUsage(){
   var r=await fetch('/api/usage'); if(authFail(r))return; var j=await r.json();
   document.getElementById('usageNote').textContent = j.time_synced ? '' : 'Clock not synced yet (needs internet) - totals will start once time syncs.';
+
+  var ov=document.getElementById('overallUsage'); ov.textContent='';
+  var t0=el('table');
+  var h0=el('tr'); ['Whole repeater (up+down)','This week','This month','All-time'].forEach(function(x){h0.appendChild(el('th',null,x));}); t0.appendChild(h0);
+  var r1=el('tr'); r1.appendChild(el('td',null,'Downloaded')); r1.appendChild(el('td',null,fmtBytes(j.overall.download_week_bytes))); r1.appendChild(el('td',null,fmtBytes(j.overall.download_month_bytes))); r1.appendChild(el('td',null,fmtBytes(j.overall.download_total_bytes))); t0.appendChild(r1);
+  var r2=el('tr'); r2.appendChild(el('td',null,'Uploaded')); r2.appendChild(el('td',null,fmtBytes(j.overall.upload_week_bytes))); r2.appendChild(el('td',null,fmtBytes(j.overall.upload_month_bytes))); r2.appendChild(el('td',null,fmtBytes(j.overall.upload_total_bytes))); t0.appendChild(r2);
+  ov.appendChild(t0);
+
   var b=document.getElementById('usageBody'); b.textContent='';
-  if(!j.devices.length){ b.appendChild(el('small',{'class':'h'},'No data yet - usage is only tracked for whitelisted devices.')); return; }
+  if(!j.devices.length){ b.appendChild(el('small',{'class':'h'},'No per-device data yet - only tracked for whitelisted devices.')); return; }
   var t=el('table'); var h=el('tr'); ['Device','This week','This month','All-time'].forEach(function(x){h.appendChild(el('th',null,x));}); t.appendChild(h);
   j.devices.forEach(function(d){ var tr=el('tr'); tr.appendChild(el('td',null,d.name||d.mac)); tr.appendChild(el('td',null,fmtBytes(d.week_bytes))); tr.appendChild(el('td',null,fmtBytes(d.month_bytes))); tr.appendChild(el('td',null,fmtBytes(d.total_bytes))); t.appendChild(tr); });
   b.appendChild(t);

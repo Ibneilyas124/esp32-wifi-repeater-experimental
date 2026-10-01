@@ -58,7 +58,7 @@ footer a{color:#7fd9bd;text-decoration:none}
     <button onclick="doLogin()">Login</button>
     <div id="err"></div>
   </section>
-  <footer><a href="#" onclick="openAbout();return false">About Developer</a> &nbsp;&middot;&nbsp; <a href="/tools">&#128295; WiFi Tools (no login)</a></footer>
+  <footer><a href="#" onclick="openAbout();return false">About Developer</a> &nbsp;&middot;&nbsp; <a href="/tools">&#128295; WiFi Tools (no login)</a><br><span id="diagLine" style="opacity:.6"></span></footer>
 </div>
 
 <div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
@@ -83,6 +83,9 @@ footer a{color:#7fd9bd;text-decoration:none}
 </div>
 <script>
 function openAbout(){document.getElementById('about').classList.add('on');}
+fetch('/api/me').then(function(r){return r.json();}).then(function(j){
+  document.getElementById('diagLine').textContent='fw v'+j.fw+' \u00b7 factory resets: '+j.reset_count;
+}).catch(function(){});
 function closeAbout(){document.getElementById('about').classList.remove('on');}
 async function doLogin(){
   const e=document.getElementById('err'); e.textContent='';

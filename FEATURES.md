@@ -1,8 +1,7 @@
 # FEATURES — ESP32 WiFi Repeater (Ibn e Ilyas Technologies)
 
-Har naya feature add ho to isi file mein neeche add karna — taake yeh
-hamesha up-to-date "A to Z" record rahe. (English mein likha hai taake
-copy-paste/search karna aasan rahe.)
+Add every new feature to this file as it's built, so it stays an
+up-to-date A-to-Z record of what the repeater can do.
 
 Current firmware version: see `FW_VERSION` in `main/main.c` (shown in the
 admin dashboard header too).
@@ -33,11 +32,33 @@ admin dashboard header too).
   not just a login wall
 - Optional **per-device upload speed limit** (Kbps) for whitelisted
   devices, enforced with a token-bucket limiter
+- Optional **overall bandwidth cap** shared by all connected devices
+  combined, set separately for upload and download (Advanced Settings >
+  "Overall upload/download cap") — this one genuinely covers both
+  directions, since it's enforced on the whole repeater's traffic rather
+  than trying to split it per device
 - Deauthentication/disassociation attack monitor (passive promiscuous
   sniffing) with a live "attack / watch / ok" status and recent-events log
 - MAC-based Kick button (disconnects a currently-connected device)
 - Hardware factory reset: hold the BOOT button ~8 s, release when the
-  blue LED blinks fast — wipes all settings back to defaults
+  blue LED blinks fast — wipes all settings back to defaults. A reset
+  counter (separate from the wiped settings) proves a reset really
+  happened even when a value looks unchanged because it matched the
+  factory default anyway — shown on the login page footer and in `/api/me`
+
+## AI Chat (`/chat`, public — opt-in, OFF by default)
+- A ChatGPT-style chat page anyone connected to the repeater can use,
+  **without logging in** — but only once the admin explicitly turns it on
+  and pastes their own API key (Advanced Settings). Off by default, since
+  a public chat left on would spend the admin's own API budget.
+- Uses the admin's own OpenAI-compatible API key (never shown to chat
+  users, stored only on the device)
+- Chat history lives in the visitor's own browser (localStorage) — the
+  repeater itself does not store conversation transcripts, both for
+  privacy and because the flash chip isn't suited to that kind of
+  continuous writing
+- Admin controls: enable/disable, API key, model name, API endpoint URL
+  (Advanced Settings)
 
 ## Admin dashboard (`/admin`, login required)
 - Fixed username `Sarfraz` (not editable — by design), changeable
@@ -102,3 +123,8 @@ admin dashboard header too).
   chip (e.g. LAN8720) wired to specific pins — this is a hardware
   addition, not just a firmware change. See chat for details; can be
   scoped as a dedicated follow-up once the PHY module is in hand.
+- **Google Drive backup sync: Google Cloud Console setup done, device-side
+  OAuth not built yet.** This needs a careful, dedicated implementation
+  pass (device-code OAuth flow, token storage/refresh, Drive API calls) -
+  deliberately phased separately rather than rushed into an already large
+  change set. See chat for the setup steps already completed.

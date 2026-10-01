@@ -1,126 +1,161 @@
-# ESP32 WiFi Repeater — Sarfraz Ibn E Ilyas
+# ESP32 WiFi Repeater — Ibn e Ilyas Technologies
 
-ESP32 DevKit V1 par asli internet-sharing WiFi repeater (NAT/NAPT based),
-ESP-IDF (Arduino nahi) par likha gaya, taake proper NAT kaam kare.
+A real internet-sharing WiFi repeater for the ESP32 DevKit V1, built on
+ESP-IDF (not the Arduino core) so that NAT actually works. Built by
+Sarfraz Qureshi.
 
-- Default AP: **SSID `Sarfraz`**, **Password `Sarfraz`**
-- Admin dashboard login: **user `admin`**, **password `Sarfraz`** (dashboard se change kar sakte ho)
-- Dashboard URL jab AP se connect ho: `http://192.168.4.1`
+See **[FEATURES.md](FEATURES.md)** for the full feature list, and
+**[LEARN_TO_EDIT.md](LEARN_TO_EDIT.md)** for where to change any text you
+see on the device's screens without touching the surrounding code.
 
-## Step 0 — Termux ko clean shuru karna (pehle yeh karo)
+## Defaults
 
-Purana kaam/files/sessions band karne ke liye:
+- Repeater WiFi: **SSID `Sarfraz`**, **password `Sarfraz1`**
+- Admin login: **username `Sarfraz`** (fixed, not changeable), **password
+  `admin`** (change this from Advanced Settings after first boot)
+- Dashboard, once connected to the repeater's own WiFi: `http://192.168.4.1`
+- Public WiFi Tools page (no login needed): `http://192.168.4.1/tools`
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `main/main.c` | Firmware: WiFi AP+STA, NAT/NAPT, guest filtering, bandwidth limits, deauth monitor, web server |
+| `main/login.html` | Public branded login page + "About Developer" popup |
+| `main/admin.html` | Admin dashboard (after login) |
+| `main/tools.html` | Public WiFi Tools page (analyzer, deauth monitor, speed test, diagnose) |
+| `sdkconfig.defaults` | Enables real NAT (`LWIP_IPV4_NAPT`) and tuned network buffers |
+| `partitions.csv` | 4MB flash partition layout |
+| `.github/workflows/build.yml` | Builds the firmware on GitHub's servers on every push |
+| `flash.sh` | Optional one-command Termux flashing script |
+| `FEATURES.md` | Full A-to-Z feature list — update this whenever a feature is added |
+| `LEARN_TO_EDIT.md` | Where to find and safely edit any on-screen text |
+
+## Step 0 — Start Termux clean (do this first)
+
+If Termux already has old sessions or stuck commands open:
 
 ```bash
-# Sab background/other Termux sessions dekhne ke liye (agar Termux:Widget ya
-# multiple sessions use kar rahe ho), naya session start karo:
-#   Termux app me left-edge se swipe karo -> "New session"
-# Purana session band karna ho to us session me:
+# To see other/background Termux sessions (if using Termux:Widget or
+# multiple sessions), start a fresh one:
+#   swipe from the left edge in the Termux app -> "New session"
+# To close an old session from inside it:
 exit
 
-# Agar koi command background me atka hai:
-# Ctrl (volume-down + C) dabao us session me, phir:
+# If a command is stuck in the foreground:
+# press Ctrl (volume-down + C) in that session, then:
 exit
 
-# Naya kaam shuru karne se pehle purani directory se nikal ke fresh
-# folder banao, taake purane files/clones mix na hon:
+# Start from a clean folder so old files/clones don't mix in:
 cd ~
 mkdir -p esp32-repeater-project
 cd esp32-repeater-project
-
-# (Optional) agar purana koi repo clone tha usi naam se, use rename/remove karo:
-# mv old-folder-name old-folder-name-backup
 ```
 
-Ab is fresh folder ke andar niche wale steps follow karo.
+Do the rest of the steps below inside this fresh folder.
 
-## Step 1 — Yeh repo GitHub par push karo
+## Step 1 — Push this repo to GitHub
 
 ```bash
 pkg install -y git
 git init
-git remote add origin https://github.com/<tumhara-username>/esp32-wifi-repeater.git
+git remote add origin https://github.com/<your-username>/esp32-wifi-repeater.git
 git add .
-git commit -m "Initial ESP32 NAT wifi repeater firmware"
+git commit -m "Initial ESP32 NAT WiFi repeater firmware"
 git branch -M main
 git push -u origin main
 ```
 
-(GitHub par pehle ek empty repo `esp32-wifi-repeater` bana lena browser se,
-phir upar wala `<tumhara-username>` apne username se replace karna.)
+(Create an empty `esp32-wifi-repeater` repository on GitHub first via the
+browser, then replace `<your-username>` above with your actual username.
+GitHub will ask for a Personal Access Token instead of your password when
+you push — Settings → Developer settings → Personal access tokens.)
 
-## Step 2 — Firmware apne aap ban jayega
+## Step 2 — The firmware builds itself
 
-Push karte hi `.github/workflows/build.yml` GitHub Actions ko trigger karega.
-GitHub ke server par ESP-IDF firmware compile hoga (tumhare phone/PC par
-kuch bhi compile nahi hoga). 2-4 minute me:
+Pushing triggers `.github/workflows/build.yml`, which compiles the
+firmware on GitHub's own servers (nothing compiles on your phone/PC).
+Takes about 3–6 minutes:
 
-- Repo ke "Actions" tab me build ki progress dekh sakte ho
-- Complete hone ke baad repo ke "Releases" section me
-  `bootloader.bin`, `partition-table.bin`, `esp32-wifi-repeater.bin` mil jayengi
+- Watch progress under the repo's **Actions** tab
+- Once it's green, the repo's **Releases** page gets a new release with
+  five files: `bootloader.bin`, `partition-table.bin`,
+  `esp32-wifi-repeater.bin`, `full-flash-0x0.bin`, and
+  **`full-flash-padded-0x0.bin`**
 
-## Step 3 — Flash karna (Termux se)
+## Step 3 — Flash it
 
-Teeno `.bin` files download karke isi folder me daalo, phir:
+**Use `full-flash-padded-0x0.bin` from the Releases page** (not
+Actions → Artifacts, which always wraps everything in a zip and has
+caused confusion before). It's a single, pre-merged image — flash it at
+offset **`0x0`**, nothing else to configure.
 
+With an Android flashing app (e.g. "ESP32 Flash/Erase"):
+- Chip: ESP32, Baud: 115200, spiMode: DIO, spiFreq: 40m, flashSize: 4MB
+- **Compression: OFF** (some Android USB-serial drivers silently drop the
+  tail of the image when compression is on — this caused real boot
+  failures during development)
+- Erase first, then flash the single file at offset `0x0`
+
+From Termux with `esptool` instead:
 ```bash
 pkg install -y python
 pip install esptool
-bash flash.sh /dev/ttyUSB0
+python3 -m esptool --chip esp32 --port /dev/ttyUSB0 --baud 115200 \
+  write_flash -z 0x0 full-flash-padded-0x0.bin
 ```
 
-(USB-OTG cable se ESP32 connect hona chahiye; agar `/dev/ttyUSB0` na mile to
-`termux-usb -l` se port dekho.)
+## Step 4 — First use
 
-## Step 4 — Use karna
+1. Connect to WiFi **`Sarfraz`** (password `Sarfraz1`) — 2.4 GHz only
+2. Open `http://192.168.4.1` in a browser
+3. Log in: username `Sarfraz`, password `admin`
+4. Under **Upstream WiFi**, enter your real internet router's SSID/password
+   and save — the repeater reboots and starts sharing internet
+5. Under **MAC Whitelist**, add your own device's MAC first — an empty
+   whitelist allows everyone; once you add even one entry, only listed
+   devices get full access (others still connect but get no internet,
+   unless "Guests: connect but no internet" is turned off)
+6. Change the admin password from **Advanced Settings**
 
-1. Phone/laptop se WiFi `Sarfraz` (password `Sarfraz`) se connect karo
-2. Browser me `http://192.168.4.1` kholo
-3. Admin login: `admin` / `Sarfraz`
-4. "Upstream WiFi" section me apne asli internet wale router ka SSID/password
-   dalo aur Save karo — ESP32 reboot hoga aur internet sharing shuru ho jayegi
-5. "MAC Whitelist" section se sirf apne devices ko allow kar sakte ho
+## Hardware factory reset
 
-## Files in this repo
+Hold the **BOOT** button on the board for about 8 seconds. When the blue
+LED starts blinking quickly, release it — all settings are wiped back to
+defaults and the repeater reboots.
 
-| File | Purpose |
-|---|---|
-| `main/main.c` | Firmware: WiFi STA+AP, NAT/NAPT, web dashboard, whitelist, config import/export |
-| `sdkconfig.defaults` | Enables real NAT (`LWIP_IPV4_NAPT`) — the part that was missing in ArduinoDroid |
-| `partitions.csv` | 4MB flash partition layout |
-| `.github/workflows/build.yml` | Builds firmware on GitHub's servers on every push |
-| `flash.sh` | One-command Termux flashing script |
+## Known limitations
 
-## v2 notes
-- Login: user `Sarfraz` (fixed), default password `admin` (changeable in Advanced Settings)
-- Advanced Settings (all editable, all with defaults): WiFi name/password/hidden/channel/max devices,
-  repeater IP, DNS for clients (default 8.8.8.8), hostname shown in the main router,
-  custom STA MAC, TX power, admin password
-- Hardware reset: hold the BOOT button ~8 s; when the blue LED blinks fast, release
-- Flash `full-flash-padded-0x0.bin` at offset `0x0` (compression OFF, baud 115200) from the Releases page
+See the "Known limitations" section at the bottom of
+[FEATURES.md](FEATURES.md) — in short: per-device data usage and
+per-device bandwidth limits only cover **uploads** (not downloads), and
+Ethernet support needs an external PHY chip wired to the board (a
+hardware addition, not a firmware-only change).
 
+## Version history
 
-## v3 notes (guest access, WiFi tools, About Developer)
-- Guests can now associate with the repeater's password but get **no internet** unless their
-  MAC is in the whitelist (Advanced Settings > "Guests: connect but no internet", default ON).
-  They can still reach the admin login page and /tools. Set it to 0 to go back to instant-kick.
-- New **/tools** page (no login): WiFi Analyzer (scans nearby networks, shows hidden BSSIDs,
-  vendor from OUI, channel congestion chart), Deauth attack monitor (passive), Speed test
-  (repeater link + real internet), Internet diagnosis (step-by-step).
-- Admin dashboard: connected-clients table now shows signal, whether each device currently has
-  internet, and a Kick button; header shows firmware version.
-- Login page footer replaced with "About Developer" (popup) and a link to /tools.
-- New advanced settings: guest_filter, deauth_monitor, deauth_alert (all with safe defaults).
-
-## v5 notes (this pass)
-- Fixed vendor-lookup "Unknown" root cause: online lookup needs internet on the
-  BROWSING device, which the v3 guest-filter blocks for non-whitelisted devices.
-  /tools now shows a clear banner explaining this and what to do about it.
-- Cleaned up duplicate/conflicting settings left over from an earlier interrupted
-  session (two competing static-IP systems, two usage-tracking systems). The
-  more complete, already-wired system was kept in every case.
-- Added the missing admin-dashboard UI for: internet speed-history chart.
-  (Data usage, bandwidth-limit-per-device, and restart-schedule backends and
-  their dashboard UI were already complete from the previous session.)
-- Added FEATURES.md (full A-to-Z feature list, update this file going forward).
-- See chat for the Ethernet-port hardware explanation (not a firmware-only change).
+- **v1** — Initial NAT-based repeater: AP+STA, web dashboard, MAC
+  whitelist, config import/export
+- **v2** — Fixed username `Sarfraz`, all settings made editable with
+  defaults (Advanced Settings), hardware factory-reset button, single
+  padded flash image for reliable Android flashing
+- **v3** — Guest access (connect but no internet unless whitelisted),
+  public `/tools` page (WiFi analyzer, deauth monitor, speed test,
+  diagnose), "About Developer" popup, kick button, firmware version shown
+  in the dashboard
+- **v4** — Fixed the vendor-lookup "Unknown" issue's first cause, added
+  password show/hide toggles, upstream-stability log, "Share this WiFi"
+  button, `LEARN_TO_EDIT.md`
+- **v5** — Per-device data usage (weekly/monthly) and upload bandwidth
+  limits, auto-restart schedule, static upstream IP for multi-repeater
+  setups, internet speed-history chart, `FEATURES.md`
+- **v6** — Fixed the real cause of the vendor-lookup false "no internet"
+  banner, added accurate whole-repeater usage tracking covering both
+  directions, and an overall (all-devices-combined) bandwidth cap for
+  both upload and download
+- **v7** (current) — Public opt-in AI chat page (`/chat`, admin supplies
+  their own API key, OFF by default), a factory-reset counter so a reset
+  can always be verified, rewrote this README and FEATURES.md fully in
+  English. Google Drive backup sync: Cloud Console setup documented, the
+  on-device OAuth implementation is intentionally phased as a dedicated
+  follow-up (see FEATURES.md "Known limitations")

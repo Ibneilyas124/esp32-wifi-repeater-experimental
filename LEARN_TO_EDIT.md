@@ -59,6 +59,10 @@ wali value badalna, baaki kuch nahi.
 **File:** `main/tools.html`
 **Dhoondo:** `WiFi Tools`, ya tab names jaise `Analyzer`, `Deauth`, `Speed`, `Diagnose`
 
+## 7b. AI Chat page (heading, placeholder text)
+**File:** `main/chat.html`
+**Dhoondo:** `AI Chat` (heading), `Message...` (input box ka placeholder)
+
 ## 8. Konse buttons/labels kahan hain (quick reference)
 | Screen par jo dikhta hai | File | Kya dhoondo |
 |---|---|---|
