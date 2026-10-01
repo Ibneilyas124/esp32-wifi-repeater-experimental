@@ -13,6 +13,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -549,7 +550,7 @@ static void usage_load(usage_entry_t *e) {
     char v[96] = "";
     nvs_get_string(key, v, sizeof(v), "");
     unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
-    if (sscanf(v, "%llu,%u,%d,%u,%d", &tb, &wb, &wn, &mb, &mn) == 5) {
+    if (sscanf(v, "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", &tb, &wb, &wn, &mb, &mn) == 5) {
         e->total_bytes = tb; e->week_bytes = wb; e->week_no = wn; e->month_bytes = mb; e->month_no = mn;
     }
 }
@@ -557,7 +558,7 @@ static void usage_load(usage_entry_t *e) {
 static void usage_save(usage_entry_t *e) {
     char key[16]; usage_key(e->mac, key, sizeof(key));
     char v[96];
-    snprintf(v, sizeof(v), "%llu,%u,%d,%u,%d", (unsigned long long)e->total_bytes, e->week_bytes, e->week_no, e->month_bytes, e->month_no);
+    snprintf(v, sizeof(v), "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", (unsigned long long)e->total_bytes, e->week_bytes, e->week_no, e->month_bytes, e->month_no);
     nvs_set_string(key, v);
 }
 
@@ -566,7 +567,7 @@ static void down_usage_load(void) {
     char v[96] = "";
     nvs_get_string("down_total", v, sizeof(v), "");
     unsigned long long tb = 0; unsigned wb = 0; int wn = 0; unsigned mb = 0; int mn = 0;
-    if (sscanf(v, "%llu,%u,%d,%u,%d", &tb, &wb, &wn, &mb, &mn) == 5) {
+    if (sscanf(v, "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", &tb, &wb, &wn, &mb, &mn) == 5) {
         s_down_usage.total_bytes = tb; s_down_usage.week_bytes = wb; s_down_usage.week_no = wn;
         s_down_usage.month_bytes = mb; s_down_usage.month_no = mn;
     }
@@ -574,7 +575,7 @@ static void down_usage_load(void) {
 
 static void down_usage_save(void) {
     char v[96];
-    snprintf(v, sizeof(v), "%llu,%u,%d,%u,%d", (unsigned long long)s_down_usage.total_bytes,
+    snprintf(v, sizeof(v), "%llu,%" PRIu32 ",%d,%" PRIu32 ",%d", (unsigned long long)s_down_usage.total_bytes,
              s_down_usage.week_bytes, s_down_usage.week_no, s_down_usage.month_bytes, s_down_usage.month_no);
     nvs_set_string("down_total", v);
 }
