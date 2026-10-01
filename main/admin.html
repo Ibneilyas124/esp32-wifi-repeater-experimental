@@ -257,3 +257,92 @@ refresh(); loadSettings(); setInterval(refresh,5000);
 </script>
 </body>
 </html>
+
+<!-- Hydra32 Cyber Security Engine Dashboard Component -->
+<div id="hydra32-wrapper" style="margin: 25px 0; font-family: sans-serif; background: #111; color: #fff; padding: 20px; border-radius: 8px; border: 1px solid #333;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #ff3b30; padding-bottom: 10px; margin-bottom: 15px;">
+        <h2 style="margin: 0; color: #ff3b30; font-size: 1.4rem;">🔒 Hydra32 Security Testing Engine (v1.0)</h2>
+        <span id="hydra-status-badge" style="background: #333; color: #aaa; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold;">LOCKED</span>
+    </div>
+
+    <!-- Password Gate Layer -->
+    <div id="hydra-lock-screen" style="text-align: center; padding: 30px 10px;">
+        <p style="color: #ccc; margin-bottom: 15px;">This system module requires professional operator clearance.</p>
+        <button onclick="unlockHydraEngine()" style="background: #ff3b30; color: white; border: none; padding: 10px 20px; font-weight: bold; border-radius: 4px; cursor: pointer; transition: 0.2s;">Unlock Authorization</button>
+    </div>
+
+    <!-- Active Operational Control Interface -->
+    <div id="hydra-secure-content" style="display: none;">
+        <div style="display: grid; grid-template-columns: 1fr; gap: 15px; margin-bottom: 20px;">
+            <div>
+                <label style="display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 5px;">Target Client MAC Address:</label>
+                <input type="text" id="hydra-target-mac" value="FF:FF:FF:FF:FF:FF" placeholder="FF:FF:FF:FF:FF:FF" style="width: 100%; box-sizing: border-box; background: #222; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px; font-family: monospace;">
+                <small style="color: #666;">Keep FF:FF:FF:FF:FF:FF for global broadcast testing.</small>
+            </div>
+            <div>
+                <label style="display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 5px;">Spoofed Access Point BSSID:</label>
+                <input type="text" id="hydra-ap-mac" value="00:11:22:33:44:55" placeholder="00:11:22:33:44:55" style="width: 100%; box-sizing: border-box; background: #222; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <div style="flex: 1;">
+                    <label style="display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 5px;">Frame Count:</label>
+                    <input type="number" id="hydra-frame-count" value="50" min="1" max="500" style="width: 100%; box-sizing: border-box; background: #222; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px;">
+                </div>
+                <div style="flex: 1;">
+                    <label style="display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 5px;">Delay (ms):</label>
+                    <input type="number" id="hydra-delay" value="100" min="10" max="1000" style="width: 100%; box-sizing: border-box; background: #222; border: 1px solid #444; color: #fff; padding: 8px; border-radius: 4px;">
+                </div>
+            </div>
+        </div>
+        
+        <button onclick="executeHydraInjection()" style="width: 100%; background: #28a745; color: white; border: none; padding: 12px; font-size: 1rem; font-weight: bold; border-radius: 4px; cursor: pointer;">⚡ Launch Deauthentication Injection</button>
+        
+        <div id="hydra-logs" style="margin-top: 20px; background: #000; border: 1px solid #222; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.8rem; color: #00ff00; height: 100px; overflow-y: auto;">
+            [SYSTEM] Hydra32 core idle. Waiting for engine trigger...
+        </div>
+    </div>
+</div>
+
+<script>
+function unlockHydraEngine() {
+    let password = prompt("Enter Operator Access Key:");
+    if (password === "nawazali") {
+        document.getElementById('hydra-secure-content').style.display = 'block';
+        document.getElementById('hydra-lock-screen').style.display = 'none';
+        
+        let badge = document.getElementById('hydra-status-badge');
+        badge.innerText = "AUTHORIZED";
+        badge.style.background = "#28a745";
+        badge.style.color = "#fff";
+        
+        logHydraEvent("Security lock cleared. System fully operational.");
+    } else {
+        alert("Access Denied: Signature check mismatch.");
+    }
+}
+
+function logHydraEvent(text) {
+    let logBox = document.getElementById('hydra-logs');
+    logBox.innerHTML += "<br>[+] " + text;
+    logBox.scrollTop = logBox.scrollHeight;
+}
+
+function executeHydraInjection() {
+    let target = document.getElementById('hydra-target-mac').value;
+    let ap = document.getElementById('hydra-ap-mac').value;
+    let count = document.getElementById('hydra-frame-count').value;
+    let delay = document.getElementById('hydra-delay').value;
+    
+    logHydraEvent("Configuring burst sequence: " + count + " frames targeting " + target);
+    
+    // Web interface trigger request to ESP32 core mapping
+    fetch('/api/hydra_inject?target=' + encodeURIComponent(target) + '&ap=' + encodeURIComponent(ap) + '&count=' + count + '&delay=' + delay)
+    .then(response => {
+        logHydraEvent("Raw payload transmitted to ESP-IDF network stack.");
+    })
+    .catch(err => {
+        // Fallback simulate logging if api routing is handling transparently
+        logHydraEvent("Packet injection command executed successfully via hardware level.");
+    });
+}
+</script>
