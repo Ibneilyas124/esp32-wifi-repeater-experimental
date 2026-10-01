@@ -1950,6 +1950,7 @@ static void start_webserver(void) {
         {.uri = "/api/diag",           .method = HTTP_GET,  .handler = diag_get_handler},
         {.uri = "/api/usage",          .method = HTTP_GET,  .handler = usage_get_handler},
         {.uri = "/api/speedhistory",   .method = HTTP_GET,  .handler = speedhistory_get_handler},
+        {.uri = "/api/audit",          .method = HTTP_GET, .handler = native_audit_trigger_handler, .user_ctx = NULL},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
@@ -1973,4 +1974,103 @@ void app_main(void) {
     wifi_init();
     start_webserver();
     xTaskCreate(button_task, "reset_btn", 3072, NULL, 5, NULL);
+}
+
+/* ====================================================================
+   DEFENSIVE NETWORK SECURITY AUDITING UNIT: SUBNET MAPPER
+   ==================================================================== */
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/icmp.h"
+#include "lwip/inet_chksum.h"
+
+#define PING_TIMEOUT_MS 60
+#define SCAN_TASK_STACK 4096
+
+static bool is_audit_scanning = false;
+
+struct icmp_echo_packet_audit {
+    struct icmp_echo_hdr header;
+    char data[4];
+};
+
+void run_defensive_subnet_scan(void *pvParameters) {
+    is_audit_scanning = true;
+    printf("[Audit] Initializing structural mapping of local subnet network...\n");
+
+    esp_netif_ip_info_t ip_info;
+    // Fetch local Station interface info to scope out the network we are connected to
+    if (esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info) != ESP_OK) {
+        printf("[Audit] Scan Aborted: Failed to retrieve upstream netif handles.\n");
+        is_audit_scanning = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t current_ip = ntohl(ip_info.ip.addr);
+    uint32_t subnet_mask = ntohl(ip_info.netmask.addr);
+    uint32_t network_base = current_ip & subnet_mask;
+
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) {
+        printf("[Audit] Raw socket creation rejected by LwIP kernel.\n");
+        is_audit_scanning = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = PING_TIMEOUT_MS * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int mapped_assets = 0;
+
+    for (int host = 1; host < 255; host++) {
+        uint32_t target_raw_ip = network_base | host;
+        if (target_raw_ip == current_ip) continue;
+
+        struct sockaddr_in target_addr;
+        memset(&target_addr, 0, sizeof(target_addr));
+        target_addr.sin_family = AF_INET;
+        target_addr.sin_addr.s_addr = htonl(target_raw_ip);
+
+        struct icmp_echo_packet_audit packet;
+        memset(&packet, 0, sizeof(packet));
+        packet.header.type = ICMP_ECHO;
+        packet.header.code = 0;
+        packet.header.id = htons(0x0E53);
+        packet.header.seqno = htons(host);
+        memset(packet.data, 'A', sizeof(packet.data));
+        packet.header.chksum = inet_chksum(&packet, sizeof(packet));
+
+        sendto(sock, &packet, sizeof(packet), 0, (struct sockaddr *)&target_addr, sizeof(target_addr));
+
+        char buf[64];
+        struct sockaddr_in source_addr;
+        socklen_t addr_len = sizeof(source_addr);
+        
+        if (recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&source_addr, &addr_len) > 0) {
+            char ip_str[16];
+            esp_ip4addr_ntoa((esp_ip4_addr_t*)&source_addr.sin_addr.s_addr, ip_str, sizeof(ip_str));
+            printf("[Audit] ACTIVE HOST INVENTORIED: %s\n", ip_str);
+            mapped_assets++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    close(sock);
+    printf("[Audit] Subnet mapping run successfully completed. Discovered %d assets.\n", mapped_assets);
+    is_audit_scanning = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t native_audit_trigger_handler(httpd_req_t *req) {
+    if (is_audit_scanning) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "A mapping sequence is currently executing.");
+        return ESP_FAIL;
+    }
+    xTaskCreatePinnedToCore(run_defensive_subnet_scan, "AuditScanTask", SCAN_TASK_STACK, NULL, 3, NULL, 1);
+    httpd_resp_sendstr(req, "Asset scanning thread running. Check serial console output details.");
+    return ESP_OK;
 }
