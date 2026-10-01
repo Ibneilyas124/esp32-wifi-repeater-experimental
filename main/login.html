@@ -106,7 +106,7 @@ footer a{color:#7fd9bd;text-decoration:none}
   <div class="ai-header">
     <div style="display:flex;align-items:center;gap:6px">
       <h2>🤖 AI Chat</h2>
-      <span style="font-size:0.7em;color:#9fb3b0">(Gemini Fast)</span>
+      <span style="font-size:0.7em;color:#9fb3b0">(Fast Response)</span>
     </div>
     <button class="mclose" style="position:static" onclick="closeAi()">&times;</button>
   </div>
@@ -180,7 +180,7 @@ async function sendAiMsg(){
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        'model': 'google/gemini-2.0-flash-lite-preview-02-05:free',
+        'model': 'openai/gpt-4o-mini',
         'messages': [{'role': 'user', 'content': txt}]
       })
     });
